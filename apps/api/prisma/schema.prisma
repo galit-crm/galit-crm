@@ -1,0 +1,556 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id           String      @id @default(uuid())
+  name         String
+  email        String      @unique
+  passwordHash String
+  role         UserRole    @default(SALES)
+  status       UserStatus  @default(ACTIVE)
+  phone        String?
+  department   String?
+  // Multi-select service ownership (used for lead routing)
+  serviceDepartments String[] @default([])
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  ownedLeads       Lead[]    @relation("LeadAssignedUser")
+  tasks            Task[]    @relation("TaskOwner")
+  reports          Report[]  @relation("ReportCreator")
+  reviewedReports  Report[]  @relation("ReportReviewer")
+  uploadedDocuments Document[] @relation("DocumentUploader")
+  collectedSamples LabSample[] @relation("LabSampleCollector")
+  assignedProjects Project[] @relation("ProjectTechnician")
+  writtenReports   Project[] @relation("ProjectReportWriter")
+  opportunities    Opportunity[]
+  workStatus       WorkStatus  @default(OFFLINE)
+
+  // Presence (simple heartbeat-based tracking)
+  isOnline         Boolean     @default(false)
+  lastSeenAt       DateTime?
+  currentWorkMode  WorkMode?
+  currentProjectId String?
+  currentProject   Project?    @relation("UserCurrentProject", fields: [currentProjectId], references: [id])
+
+  leadActivitiesCreated LeadActivity[]
+}
+
+model Project {
+  id                    String         @id @default(uuid())
+  projectNumber         String?
+  name                  String
+  client                String
+  status                ProjectStatus  @default(NEW)
+  progress              Int            @default(0)
+  dueDate               DateTime?
+  siteVisitDate         DateTime?
+  siteVisitTime         String?
+  city                  String?
+  address               String?
+  service               String?
+  serviceCategory       String?
+  serviceSubType        String?
+  contactName           String?
+  contactPhone          String?
+  urgency               String?
+  fieldContactName      String?
+  fieldContactPhone     String?
+  requiresReport        Boolean        @default(true)
+  requiresSampling      Boolean        @default(false)
+  notes                 String?
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  customerId            String?
+  customer              Customer?      @relation(fields: [customerId], references: [id])
+
+  assignedTechnicianId  String?
+  assignedTechnician    User?          @relation("ProjectTechnician", fields: [assignedTechnicianId], references: [id])
+
+  assignedReportWriterId String?
+  assignedReportWriter   User?         @relation("ProjectReportWriter", fields: [assignedReportWriterId], references: [id])
+
+  tasks                 Task[]
+  quotes                Quote[]
+  reports               Report[]
+  documents             Document[]
+  labSamples            LabSample[]
+
+  // Presence: which users selected this as current project
+  activeUsers           User[]         @relation("UserCurrentProject")
+
+  leads                 Lead[]
+}
+
+model Customer {
+  id          String         @id @default(uuid())
+  name        String
+  type        CustomerType
+  contactName String
+  phone       String
+  email       String
+  city        String
+  status      String         @default("ACTIVE")
+  services    String[]
+  notes       String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  leads       Lead[]
+  quotes      Quote[]
+  tasks       Task[]
+  reports     Report[]
+  projects    Project[]
+  opportunities Opportunity[]
+  documents   Document[]
+  labSamples  LabSample[]
+}
+
+model Lead {
+  id             String      @id @default(uuid())
+  // Legacy fields (kept for backwards compatibility with existing UI/API)
+  firstName      String
+  lastName       String?
+  phone          String?
+  company        String?
+  service        String?
+  source         String?
+  site           String?
+  status         String      @default("NEW")
+  stage          LeadStage   @default(NEW)
+  assignee       String?
+  notes          String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @default(now()) @updatedAt
+
+  // Spec-aligned fields
+  fullName       String?
+  email          String?
+  city           String?
+  address        String?
+  utm_source     String?
+  utm_medium     String?
+  utm_campaign   String?
+  utm_content    String?
+  utm_term       String?
+  serviceType    String?
+  followUp1Date  DateTime?
+  followUp2Date  DateTime?
+  nextFollowUpDate DateTime?
+  leadStatus     LeadStatus  @default(NEW)
+
+  customerId     String?
+  customer       Customer?   @relation(fields: [customerId], references: [id])
+
+  assignedUserId String?
+  assignedUser   User?       @relation("LeadAssignedUser", fields: [assignedUserId], references: [id])
+
+  opportunities  Opportunity[]
+  quotes         Quote[]
+  tasks          Task[]
+
+  projectId      String?
+  project        Project?    @relation(fields: [projectId], references: [id])
+
+  activities     LeadActivity[]
+}
+
+model LeadActivity {
+  id          String   @id @default(uuid())
+  leadId      String
+  lead        Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  type        String
+  message     String?
+  createdById String?
+  createdBy   User?    @relation(fields: [createdById], references: [id])
+  createdAt   DateTime @default(now())
+}
+
+enum WorkStatus {
+  AVAILABLE
+  IN_FIELD
+  IN_OFFICE
+  OFFLINE
+}
+
+enum WorkMode {
+  OFFICE
+  FIELD
+}
+
+model Opportunity {
+  id                   String     @id @default(uuid())
+  customerId           String?
+  customer             Customer?  @relation(fields: [customerId], references: [id])
+  leadId               String?
+  lead                 Lead?      @relation(fields: [leadId], references: [id])
+  projectOrServiceName String
+  estimatedValue       Float      @default(0)
+  pipelineStage        OpportunityStage @default(NEW)
+  targetCloseDate      DateTime?
+  assignedUserId       String?
+  assignedUser         User?      @relation(fields: [assignedUserId], references: [id])
+  notes                String?
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+
+  quotes               Quote[]
+}
+
+model Quote {
+  id          String       @id @default(uuid())
+  quoteNumber String?
+  service     String
+  description String?
+  // Legacy amount (kept); spec uses amountBeforeVat + vatPercent + discount
+  amount      Float
+  status      QuoteStatus  @default(DRAFT)
+  validTo     DateTime
+  pdfPath     String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  customerId  String
+  customer    Customer     @relation(fields: [customerId], references: [id])
+
+  leadId      String?
+  lead        Lead?        @relation(fields: [leadId], references: [id])
+
+  projectId   String?
+  project     Project?     @relation(fields: [projectId], references: [id])
+
+  opportunityId           String?
+  opportunity             Opportunity? @relation(fields: [opportunityId], references: [id])
+
+  // Spec-aligned quote fields
+  validityDate            DateTime?
+  amountBeforeVat         Float?     @default(0)
+  vatPercent              Float?     @default(17)
+  discountType            DiscountType @default(NONE)
+  discountValue           Float?     @default(0)
+  totalAmount             Float?     @default(0)
+  paymentTerms            String?
+  notes                   String?
+  digitalSignatureStatus  DigitalSignatureStatus @default(NOT_REQUESTED)
+
+  // Automation helpers
+  sentAt                  DateTime?
+  reminderNextAt          DateTime?
+  reminderCount           Int?       @default(0)
+
+  // Origami preparation (no integration yet)
+  signedPdfPath           String?
+  digitalCertificateMeta  Json?
+  signatureRequestedAt    DateTime?
+  signedAt                DateTime?
+}
+
+model Task {
+  id          String        @id @default(uuid())
+  title       String
+  description String?
+  dueDate     DateTime?
+  priority    TaskPriority  @default(MEDIUM)
+  status      TaskStatus    @default(OPEN)
+  type        TaskType      @default(GENERAL)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  ownerId     String
+  owner       User          @relation("TaskOwner", fields: [ownerId], references: [id])
+
+  customerId  String?
+  customer    Customer?     @relation(fields: [customerId], references: [id])
+
+  leadId      String?
+  lead        Lead?         @relation(fields: [leadId], references: [id])
+
+  projectId   String?
+  project     Project?      @relation(fields: [projectId], references: [id])
+}
+
+model Report {
+  id          String      @id @default(uuid())
+  projectId      String?
+  project        Project?    @relation(fields: [projectId], references: [id])
+
+  customerId     String?
+  customer       Customer?   @relation(fields: [customerId], references: [id])
+
+  title          String
+  // Legacy fields kept for backwards compatibility (older seed/UI)
+  type           String?
+  filtersJson    String?     @default("{}")
+
+  reportType     ReportType   @default(OTHER)
+  status         ReportStatus @default(WAITING_DATA)
+
+  createdById    String
+  createdBy      User        @relation("ReportCreator", fields: [createdById], references: [id])
+
+  reviewedById   String?
+  reviewedBy     User?       @relation("ReportReviewer", fields: [reviewedById], references: [id])
+
+  reportDate     DateTime?
+  sentAt         DateTime?
+  pdfPath        String?
+  version        Int         @default(1)
+  internalNotes  String?
+  clientNotes    String?
+
+  documents      Document[]
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+}
+
+model Document {
+  id            String       @id @default(uuid())
+  name          String
+  documentType  DocumentType @default(OTHER)
+  filePath      String
+  description   String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  projectId     String?
+  project       Project?     @relation(fields: [projectId], references: [id])
+
+  customerId    String?
+  customer      Customer?    @relation(fields: [customerId], references: [id])
+
+  reportId      String?
+  report        Report?      @relation(fields: [reportId], references: [id])
+
+  uploadedById  String?
+  uploadedBy    User?        @relation("DocumentUploader", fields: [uploadedById], references: [id])
+}
+
+model LabSample {
+  id                  String           @id @default(uuid())
+  sampleNumber        String
+  sampleType          LabSampleType    @default(OTHER)
+  sampleStatus        LabSampleStatus  @default(COLLECTED)
+  collectedAt         DateTime?
+  receivedAt          DateTime?
+  analyzedAt          DateTime?
+  locationDescription String?
+  testType            String?
+  method              String?
+  resultValue         String?
+  resultUnit          String?
+  resultStatus        LabResultStatus  @default(PENDING)
+  resultFilePath      String?
+  notes               String?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  projectId           String?
+  project             Project?         @relation(fields: [projectId], references: [id])
+
+  customerId          String?
+  customer            Customer?        @relation(fields: [customerId], references: [id])
+
+  collectedById       String?
+  collectedBy         User?            @relation("LabSampleCollector", fields: [collectedById], references: [id])
+}
+
+model SystemSetting {
+  key        String   @id
+  value      Json
+  updatedAt  DateTime @updatedAt
+  createdAt  DateTime @default(now())
+}
+
+model QuoteItemCatalog {
+  id               String   @id @default(uuid())
+  itemCode         String   @unique
+  name             String
+  description      String?
+  serviceCategory  String?
+  serviceSubType   String?
+  basePrice        Float    @default(0)
+  billingUnit      String
+  vatPercent       Float    @default(17)
+  isActive         Boolean  @default(true)
+  requiresQuantity Boolean  @default(true)
+  requiresSiteVisit Boolean @default(false)
+  requiresReport   Boolean  @default(false)
+  notes            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+enum ReportType {
+  RADIATION_REPORT
+  ACOUSTIC_REPORT
+  AIR_QUALITY_REPORT
+  ASBESTOS_REPORT
+  RADON_REPORT
+  ODOUR_REPORT
+  SOIL_REPORT
+  LAB_REPORT
+  OTHER
+}
+
+enum ReportStatus {
+  WAITING_DATA
+  IN_WRITING
+  IN_REVIEW
+  SENT
+  CLOSED
+}
+
+enum DocumentType {
+  CONTRACT
+  QUOTE
+  PLAN
+  PHOTO
+  REPORT
+  LAB_RESULT
+  CERTIFICATE
+  INVOICE
+  OTHER
+}
+
+enum LabSampleType {
+  AIR
+  SURFACE
+  WATER
+  SOIL
+  RADON
+  ASBESTOS
+  MICROBIOLOGY
+  OTHER
+}
+
+enum LabSampleStatus {
+  COLLECTED
+  RECEIVED
+  IN_ANALYSIS
+  COMPLETED
+  REPORTED
+}
+
+enum LabResultStatus {
+  NORMAL
+  ABNORMAL
+  PENDING
+}
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  SALES
+  TECHNICIAN
+  EXPERT
+  BILLING
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum CustomerType {
+  COMPANY
+  PUBLIC
+  PRIVATE
+}
+
+enum LeadStage {
+  NEW
+  CONTACTED
+  QUOTE_SENT
+  NEGOTIATION
+  WON
+  LOST
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  FU_1
+  FU_2
+  QUOTE_SENT
+  NEGOTIATION
+  WON
+  LOST
+  NOT_RELEVANT
+}
+
+enum OpportunityStage {
+  NEW
+  QUALIFIED
+  PROPOSAL
+  NEGOTIATION
+  WON
+  LOST
+}
+
+enum QuoteStatus {
+  DRAFT
+  SENT
+  APPROVED
+  REJECTED
+  SIGNED
+  EXPIRED
+}
+
+enum DiscountType {
+  NONE
+  CURRENCY
+  PERCENT
+}
+
+enum DigitalSignatureStatus {
+  NOT_REQUESTED
+  REQUESTED
+  SIGNED
+  FAILED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TaskStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+enum TaskType {
+  SALES_FOLLOWUP
+  QUOTE_PREPARATION
+  COORDINATION
+  FIELD_WORK
+  REPORT_WRITING
+  REVIEW
+  COLLECTION
+  GENERAL
+}
+
+enum ProjectStatus {
+  NEW
+  WAITING_QUOTE
+  WAITING_APPROVAL
+  SCHEDULED
+  ON_THE_WAY
+  FIELD_WORK_DONE
+  WAITING_DATA
+  REPORT_WRITING
+  SENT_TO_CLIENT
+  CLOSED
+  POSTPONED
+  CANCELLED
+}
