@@ -3431,10 +3431,11 @@ function Sidebar({
   ];
 
   const operationItems: SidebarItemDef[] = [
-    { key: 'tasks', label: 'משימות', Icon: CheckSquare, kind: 'current' },
     { key: 'quotes', label: 'הצעות מחיר', Icon: FileText, kind: 'current' },
+    { key: 'tasks', label: 'משימות', Icon: CheckSquare, kind: 'current' },
     { key: 'projects', label: 'פרויקטים', Icon: FolderKanban, kind: 'current' },
     { key: 'reports', label: 'דוחות', Icon: BarChart3, kind: 'current' },
+    { key: 'users', label: 'עובדים', Icon: Users, kind: 'current' },
     { key: 'fieldSchedule', label: 'יומן שטח', Icon: CalendarDays, kind: 'view', viewKey: 'fieldSchedule' },
     { key: 'lab', label: 'מעבדה / דגימות', Icon: FlaskConical, kind: 'current' },
   ];
