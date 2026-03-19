@@ -757,7 +757,7 @@ function timelineDateLabel(value?: string | Date | null) {
 
 function EntityTimeline({ items, emptyText = 'אין אירועים להצגה' }: { items: EntityTimelineItem[]; emptyText?: string }) {
   const sorted = useMemo(
-    () => [...items].sort((a, b) => timelineTs(b.at) - timelineTs(a.at)),
+    () => [...items].sort((a, b) => timelineTs(a.at) - timelineTs(b.at)),
     [items],
   );
 
@@ -1606,23 +1606,17 @@ function CustomerProfile({
   const customerTimeline = useMemo(() => {
     const items: EntityTimelineItem[] = [];
 
-    if (customer.createdAt) {
-      items.push({
-        id: `customer-created-${customer.id}`,
-        title: 'נוצר',
-        at: customer.createdAt,
-        description: 'נוצר כרטיס לקוח במערכת',
-      });
-    }
-
     for (const lead of leads) {
       const leadName = `${lead.firstName || ''} ${lead.lastName || ''}`.trim() || lead.fullName || lead.name || 'ליד';
-      if (lead.createdAt) {
+
+      // "דיברו" דורש פעילות/לוג שיחה מלא. אין לנו כאן activity log, לכן לא מציגים אירוע זה.
+      // "שויך" ניתן להסיק בצורה בטוחה אם יש assignedUserId.
+      if (lead.assignedUserId) {
         items.push({
-          id: `customer-lead-created-${lead.id}`,
-          title: 'דיברו',
-          at: lead.createdAt,
-          description: `נוצר ליד: ${leadName}`,
+          id: `customer-lead-assigned-${lead.id}`,
+          title: 'שויך',
+          at: lead.updatedAt || lead.createdAt || null,
+          description: 'הליד שויך לאחראי',
         });
       }
       const st = (lead.leadStatus || lead.status || '').toString().toUpperCase();
@@ -1664,7 +1658,7 @@ function CustomerProfile({
     }
 
     return items;
-  }, [customer.id, customer.createdAt, leads, quotes]);
+  }, [customer.id, leads, quotes, customer]);
 
   return (
     <div className="space-y-6">
@@ -2903,22 +2897,13 @@ function LeadDetailPage({
       });
     }
 
-    if (linkedProject?.id) {
+    if (lead.projectId) {
       items.push({
-        id: `lead-project-open-${linkedProject.id}`,
+        id: `lead-project-open-${lead.id}`,
         title: 'נפתח פרויקט',
-        at: linkedProject.createdAt || lead.updatedAt || null,
-        description: linkedProject.name || 'נפתח פרויקט מהליד',
+        at: lead.updatedAt || lead.createdAt || null,
+        description: 'נפתח פרויקט עבור הליד',
       });
-      const pst = (linkedProject.status || '').toString().toUpperCase();
-      if (pst === 'CLOSED' || pst === 'COMPLETED') {
-        items.push({
-          id: `lead-project-closed-${linkedProject.id}`,
-          title: 'נסגר',
-          at: linkedProject.updatedAt || linkedProject.createdAt || null,
-          description: `הפרויקט נסגר: ${linkedProject.name || '-'}`,
-        });
-      }
     }
 
     return items;
@@ -2938,7 +2923,6 @@ function LeadDetailPage({
     assignedUser?.name,
     activities,
     linkedQuotes,
-    linkedProject,
   ]);
 
   return (
@@ -6545,6 +6529,60 @@ function ProjectDetailsPage({
     }
   };
 
+  const projectTimeline = useMemo(() => {
+    const items: EntityTimelineItem[] = [];
+
+    const projectCreatedAt = (project as any).createdAt as string | Date | null | undefined;
+    const projectUpdatedAt = (project as any).updatedAt as string | Date | null | undefined;
+
+    if (projectCreatedAt) {
+      items.push({
+        id: `project-created-${project.id}`,
+        title: 'נוצר',
+        at: projectCreatedAt,
+        description: `נוצר פרויקט: ${project.name}`,
+      });
+    }
+
+    const techName =
+      project.assignedTechnician?.name ||
+      technicians.find((u) => u.id === (project.assignedTechnicianId ?? ''))?.name ||
+      '';
+
+    if (techName) {
+      items.push({
+        id: `project-assigned-tech-${project.id}`,
+        title: 'שויך',
+        at: projectUpdatedAt || projectCreatedAt || null,
+        description: `שויך לטכנאי: ${techName}`,
+      });
+    }
+
+    for (const q of quotes) {
+      const st = (q?.status || '').toString().toUpperCase();
+      if (['SENT', 'APPROVED', 'SIGNED'].includes(st)) {
+        items.push({
+          id: `project-quote-sent-${q.id}`,
+          title: 'נשלחה הצעה',
+          at: q.updatedAt || q.createdAt || null,
+          description: q.quoteNumber ? `מספר הצעה: ${q.quoteNumber}` : 'נשלחה הצעת מחיר',
+        });
+      }
+    }
+
+    const pst = (project.status || '').toString().toUpperCase();
+    if (pst === 'CLOSED' || pst === 'COMPLETED') {
+      items.push({
+        id: `project-closed-${project.id}`,
+        title: 'נסגר',
+        at: projectUpdatedAt || projectCreatedAt || null,
+        description: `הפרויקט נסגר`,
+      });
+    }
+
+    return items;
+  }, [project.id, project.status, project.assignedTechnicianId, project.assignedTechnician?.name, project.name, technicians, quotes]);
+
   return (
     <div className="space-y-5">
       <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -7012,7 +7050,7 @@ function ProjectDetailsPage({
         <Card>
           <CardContent className="space-y-3 p-5">
             <div className="font-semibold">היסטוריה</div>
-            <div className="text-sm text-slate-500">שלב הבא: לוג פעולות לפרויקט (שינויים, סטטוסים, שיוכים).</div>
+            <EntityTimeline items={projectTimeline} emptyText="אין אירועים להצגה לפרויקט זה" />
           </CardContent>
         </Card>
       )}
