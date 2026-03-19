@@ -5888,7 +5888,7 @@ function QuotesPage({
         headers: authHeaders(currentUser),
       });
     } catch {
-      console.log('PDF create failed (preview mode only)');
+      // ignore pdf generation failures; user can still proceed without pdf
     }
   };
 
@@ -9810,7 +9810,6 @@ function UsersPage({
     };
 
     try {
-      console.log('Creating user with payload', payload);
       const res = await fetch('http://localhost:3001/users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
@@ -10606,7 +10605,7 @@ export default function GalitCRMPrototype() {
     } catch (e) {
       const msg = e instanceof Error ? e.message : '';
       if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('Load failed')) {
-        setLoginError('לא ניתן להתחבר לשרת. בדוק ש־http://localhost:3001 פועל ושגישה מדפדפן מול השרת מוגדרת נכון.');
+        setLoginError('לא ניתן להתחבר לשרת. בדוק שה-API זמין ושגישה מדפדפן מול השרת מוגדרת נכון.');
       } else {
         setLoginError(msg || 'אימייל או סיסמה שגויים');
       }

@@ -44,11 +44,6 @@ export class UsersService {
     };
 
     try {
-      // Temporary debug logs for creation flow
-      // eslint-disable-next-line no-console
-      console.log('UsersService.create received data:', data);
-      // eslint-disable-next-line no-console
-      console.log('UsersService.create payload for Prisma:', payload);
       return await this.prisma.user.create({ data: payload });
     } catch (e: any) {
       // eslint-disable-next-line no-console
