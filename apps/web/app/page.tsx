@@ -10135,8 +10135,8 @@ export default function GalitCRMPrototype() {
 
   // Deployment support:
   // The app currently calls the backend using absolute URLs hardcoded to localhost.
-  // In production (Vercel / external host) we remap those calls at runtime via NEXT_PUBLIC_API_BASE_URL.
-  const apiBaseUrl = (process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001').replace(/\/$/, '');
+  // In production (Vercel / external host) we remap those calls at runtime via NEXT_PUBLIC_API_URL.
+  const apiBaseUrl = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001').replace(/\/$/, '');
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
