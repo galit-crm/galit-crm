@@ -6,7 +6,8 @@ import { RolesGuard } from '../auth/roles.guard';
 
 @Controller('leads')
 @UseGuards(RolesGuard)
-@Roles('ADMIN', 'MANAGER', 'SALES')
+/** תואם ל-canAccess בפרונט (כולל expert עם מסכי לידים) */
+@Roles('ADMIN', 'MANAGER', 'SALES', 'EXPERT')
 export class LeadsController {
 
   constructor(private leadsService: LeadsService) {}
@@ -42,8 +43,8 @@ export class LeadsController {
   }
 
   @Delete(':id')
-  removeLead(@Param('id') id: string) {
-    return this.leadsService.remove(id);
+  removeLead(@Param('id') id: string, @Req() req: any) {
+    return this.leadsService.remove(id, req.user);
   }
 
   @Patch(':id/stage')

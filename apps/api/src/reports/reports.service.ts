@@ -82,7 +82,7 @@ export class ReportsService {
   async getDashboard(user?: { id?: string; role?: string }) {
     const role = (user?.role || '').toUpperCase();
     if (!role) throw new UnauthorizedException('Missing role');
-    if (role !== 'ADMIN' && role !== 'MANAGER') throw new ForbiddenException();
+    if (role !== 'ADMIN' && role !== 'MANAGER' && role !== 'EXPERT') throw new ForbiddenException();
 
     const now = new Date();
     const startOfWeek = new Date(now);

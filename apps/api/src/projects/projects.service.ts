@@ -1,9 +1,62 @@
-import { ForbiddenException, Injectable, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, UnauthorizedException } from '@nestjs/common';
+import { ProjectStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
 @Injectable()
 export class ProjectsService {
   constructor(private readonly prisma: PrismaService) {}
+
+  async create(data: any, user?: { id?: string; role?: string }) {
+    const role = (user?.role || '').toUpperCase();
+    if (!role) throw new UnauthorizedException('Missing role');
+    if (role !== 'ADMIN' && role !== 'MANAGER') throw new ForbiddenException();
+
+    const name = (data?.name ?? '').toString().trim();
+    const client = (data?.client ?? '').toString().trim();
+    if (!name || !client) {
+      throw new BadRequestException('שם פרויקט ושדה client (שם לקוח מציג) הם חובה');
+    }
+
+    const statusRaw = (data?.status ?? '').toString().toUpperCase();
+    const status =
+      statusRaw && (Object.values(ProjectStatus) as string[]).includes(statusRaw)
+        ? (statusRaw as ProjectStatus)
+        : ProjectStatus.NEW;
+
+    return this.prisma.project.create({
+      data: {
+        importLegacyId: data?.importLegacyId != null ? String(data.importLegacyId).trim() || null : null,
+        projectNumber: data?.projectNumber != null ? String(data.projectNumber).trim() || null : null,
+        name,
+        client,
+        customerId: data?.customerId || null,
+        service: data?.service ?? null,
+        serviceCategory: data?.serviceCategory ?? null,
+        serviceSubType: data?.serviceSubType ?? null,
+        contactName: data?.contactName ?? null,
+        contactPhone: data?.contactPhone ?? null,
+        urgency: data?.urgency ?? null,
+        city: data?.city ?? null,
+        address: data?.address ?? null,
+        status,
+        notes: data?.notes ?? null,
+        dueDate: data?.dueDate ? new Date(data.dueDate) : null,
+        siteVisitDate: data?.siteVisitDate ? new Date(data.siteVisitDate) : null,
+        siteVisitTime: data?.siteVisitTime ?? null,
+        fieldContactName: data?.fieldContactName ?? null,
+        fieldContactPhone: data?.fieldContactPhone ?? null,
+        requiresReport: data?.requiresReport !== undefined ? Boolean(data.requiresReport) : undefined,
+        requiresSampling: data?.requiresSampling !== undefined ? Boolean(data.requiresSampling) : undefined,
+        assignedTechnicianId: data?.assignedTechnicianId || null,
+        assignedReportWriterId: data?.assignedReportWriterId || null,
+      },
+      include: {
+        assignedTechnician: { select: { id: true, name: true, email: true } },
+        assignedReportWriter: { select: { id: true, name: true, email: true } },
+        customer: { select: { id: true, name: true, city: true } },
+      },
+    });
+  }
 
   async findAll(user?: { id?: string; role?: string }) {
     const role = (user?.role || '').toUpperCase();

@@ -1,5 +1,5 @@
 import { ForbiddenException, Injectable, UnauthorizedException } from '@nestjs/common';
-import { OpportunityStage, QuoteStatus, UserRole, WorkMode, TaskStatus } from '@prisma/client';
+import { OpportunityStage, Prisma, QuoteStatus, ReportStatus, UserRole, WorkMode, TaskStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
 function startOfMonth(d = new Date()) {
@@ -21,6 +21,7 @@ export class DashboardService {
     if (!role) throw new UnauthorizedException('Missing role');
     if (role !== 'ADMIN' && role !== 'MANAGER') throw new ForbiddenException();
 
+    try {
     // Temporary config until real quota/target system exists
     const monthlyRevenueTarget = 450_000;
 
@@ -37,6 +38,7 @@ export class DashboardService {
       leads,
       projects,
       tasks,
+      reportsWaitingCount,
     ] = await Promise.all([
       this.prisma.user.findMany({
         where: {
@@ -73,6 +75,10 @@ export class DashboardService {
       }),
       this.prisma.task.findMany({
         select: { id: true, status: true, dueDate: true },
+      }),
+
+      this.prisma.report.count({
+        where: { status: ReportStatus.WAITING_DATA },
       }),
     ]);
 
@@ -239,16 +245,28 @@ export class DashboardService {
       .map(([service, value]) => ({ service, value }))
       .sort((a, b) => b.value - a.value);
 
-    const openProjects = projects
-      .filter((p) => !['CLOSED', 'CANCELLED'].includes((p.status as any) || ''))
-      .slice(0, 12)
+    const openProjectsFiltered = projects.filter((p) => !['CLOSED', 'CANCELLED'].includes((p.status as any) || ''));
+    const projectsOpenCount = openProjectsFiltered.length;
+    const projectsInFieldCount = openProjectsFiltered.filter((p) => ['ON_THE_WAY', 'FIELD_WORK_DONE'].includes((p.status as any) || '')).length;
+
+    const openProjects = openProjectsFiltered
       .map((p) => ({
         id: p.id,
-        name: p.name,
+        title: p.name,
+        client: p.client,
         status: p.status,
+        priority: p.urgency ?? null,
         dueDate: p.dueDate ? p.dueDate.toISOString().slice(0, 10) : null,
-        assigned: p.assignedTechnician?.name || null,
-      }));
+        technician: p.assignedTechnician?.name || null,
+        updatedAt: p.updatedAt.toISOString(),
+      }))
+      .sort((a, b) => {
+        const dueA = a.dueDate ? new Date(a.dueDate).getTime() : Number.POSITIVE_INFINITY;
+        const dueB = b.dueDate ? new Date(b.dueDate).getTime() : Number.POSITIVE_INFINITY;
+        if (dueA !== dueB) return dueA - dueB;
+        return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+      })
+      .slice(0, 10);
 
     const leadStatusOf = (l: any) => ((l?.leadStatus || l?.status || l?.stage || '') as string).toUpperCase();
     const leadStatuses = leads.map(leadStatusOf);
@@ -349,11 +367,73 @@ export class DashboardService {
         tasksOpen,
         tasksOverdue,
         quotesOpenActive,
+        projectsOpen: projectsOpenCount,
+        projectsInField: projectsInFieldCount,
+        reportsWaiting: reportsWaitingCount,
       },
       workingNowEmployees,
       assumptions: {
         monthlyRevenueTarget: 'Temporary constant (450,000) until quota system exists',
         wonRevenueThisMonth: 'Sum of APPROVED (and legacy SIGNED) quotes where updatedAt is within current month',
+        pipeline: 'Sum of estimatedValue for opportunities not WON/LOST',
+        winRate: 'Opportunities WON / (WON+LOST)',
+        weeklyActivity: 'Count of leads updated this week with leadStatus FU_1/FU_2 (no meetings/events table yet)',
+        inactivity: 'Lead.updatedAt older than 7 days (no activity log yet)',
+      },
+    };
+    } catch (e) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2022') {
+        return this.managerEmptyPayload();
+      }
+      throw e;
+    }
+  }
+
+  /** Safe JSON when Prisma schema is ahead of DB (missing columns / relations). */
+  private managerEmptyPayload() {
+    const now = new Date();
+    const monthlyRevenueTarget = 450_000;
+    return {
+      updatedAt: now.toISOString(),
+      config: { monthlyRevenueTarget },
+      kpis: {
+        monthlyRevenueTarget,
+        wonRevenueThisMonth: 0,
+        attainmentPct: 0,
+        openPipelineValue: 0,
+        pipelinePctOfTarget: 0,
+        forecast: { best: 0, realistic: 0, worst: 0 },
+        teamWinRate: 0,
+      },
+      leaderboard: [],
+      charts: {
+        pipelineStagesByRep: [],
+        leadSourcesPie: [],
+        quotaProgress: [],
+        conversionFunnel: [
+          { step: 'לידים', value: 0 },
+          { step: 'הצעה נשלחה', value: 0 },
+          { step: 'זכייה', value: 0 },
+        ],
+      },
+      alerts: { agingDeals: [], inactiveLeads: [] },
+      breakdowns: { leadsByServiceType: [], openProjects: [] },
+      coreCounts: {
+        leadsNew: 0,
+        leadsInTreatment: 0,
+        leadsWon: 0,
+        leadsLost: 0,
+        tasksOpen: 0,
+        tasksOverdue: 0,
+        quotesOpenActive: 0,
+        projectsOpen: 0,
+        projectsInField: 0,
+        reportsWaiting: 0,
+      },
+      workingNowEmployees: [],
+      assumptions: {
+        monthlyRevenueTarget: 'Temporary constant (450,000) until quota system exists',
+        wonRevenueThisMonth: 'Fallback: apply DB migrations (P2022 schema drift)',
         pipeline: 'Sum of estimatedValue for opportunities not WON/LOST',
         winRate: 'Opportunities WON / (WON+LOST)',
         weeklyActivity: 'Count of leads updated this week with leadStatus FU_1/FU_2 (no meetings/events table yet)',

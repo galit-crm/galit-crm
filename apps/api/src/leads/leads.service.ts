@@ -1,5 +1,5 @@
-import { Injectable } from '@nestjs/common';
-import { LeadStage, LeadStatus, ProjectStatus, QuoteStatus, UserRole, UserStatus } from '@prisma/client';
+import { ForbiddenException, Injectable } from '@nestjs/common';
+import { LeadStage, LeadStatus, Prisma, ProjectStatus, QuoteStatus, UserRole, UserStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
 @Injectable()
@@ -8,10 +8,26 @@ export class LeadsService {
   constructor(private readonly prisma: PrismaService) {}
 
   async findAll() {
-    return this.prisma.lead.findMany({
-      orderBy: { createdAt: 'desc' },
-      include: { assignedUser: true, customer: true, project: true },
-    });
+    try {
+      return await this.prisma.lead.findMany({
+        orderBy: { createdAt: 'desc' },
+        include: { assignedUser: true, customer: true, project: true },
+      });
+    } catch (e) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2022') {
+        try {
+          return await this.prisma.lead.findMany({
+            orderBy: { createdAt: 'desc' },
+          });
+        } catch (e2) {
+          if (e2 instanceof Prisma.PrismaClientKnownRequestError && e2.code === 'P2022') {
+            return this.prisma.$queryRawUnsafe(`SELECT * FROM "Lead" ORDER BY "createdAt" DESC`);
+          }
+          throw e2;
+        }
+      }
+      throw e;
+    }
   }
 
   async findOne(id: string) {
@@ -49,10 +65,25 @@ export class LeadsService {
     return updated;
   }
 
-  async remove(id: string) {
-    return this.prisma.lead.delete({
-      where: { id },
+  async remove(id: string, actor?: { id?: string; role?: string }) {
+    const role = (actor?.role || '').toUpperCase();
+
+    // Stage 1: keep ADMIN/MANAGER operational even if flag is not set.
+    if (role === 'ADMIN' || role === 'MANAGER') {
+      return this.prisma.lead.delete({ where: { id } });
+    }
+
+    const userId = actor?.id;
+    if (!userId) throw new ForbiddenException();
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, canDeleteLeads: true },
     });
+
+    if (!user?.canDeleteLeads) throw new ForbiddenException();
+
+    return this.prisma.lead.delete({ where: { id } });
   }
 
   async updateStage(id: string, stage: LeadStage, user?: { id?: string }) {
@@ -318,6 +349,8 @@ export class LeadsService {
     if ('status' in data) setIf('status', data.status);
     if ('assignee' in data) setIf('assignee', data.assignee);
     if ('customerId' in data) setIf('customerId', data.customerId);
+    if ('importLegacyId' in data) setIf('importLegacyId', data.importLegacyId != null ? String(data.importLegacyId).trim() || null : null);
+    if ('projectId' in data) setIf('projectId', data.projectId || null);
 
     return out;
   }

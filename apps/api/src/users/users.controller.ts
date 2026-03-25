@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Req, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { UsersService } from './users.service';
 import { Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
@@ -14,32 +14,60 @@ export class UsersController {
     return this.usersService.activeNow(req.user);
   }
 
-  @Get()
+  @Post('transfer-data')
   @UseGuards(RolesGuard)
   @Roles('ADMIN', 'MANAGER')
-  findAll() {
-    return this.usersService.findAll();
+  transferData(@Body() body: any, @Req() req: any) {
+    const { fromUserId, toUserId, leads, customers, tasks, projects, quotes, activities } = body || {};
+    return this.usersService.transferAssignments(
+      fromUserId,
+      toUserId,
+      {
+        leads: !!leads,
+        customers: !!customers,
+        tasks: !!tasks,
+        projects: !!projects,
+        quotes: !!quotes,
+        activities: !!activities,
+      },
+      req.user,
+    );
+  }
+
+  @Post('copy-permissions')
+  @UseGuards(RolesGuard)
+  @Roles('ADMIN', 'MANAGER')
+  copyPermissions(@Body() body: any, @Req() req: any) {
+    const { fromUserId, toUserId } = body || {};
+    return this.usersService.copyPermissionsFromUser(fromUserId, toUserId, req.user);
+  }
+
+  @Get()
+  @UseGuards(RolesGuard)
+  @Roles('ADMIN', 'MANAGER', 'SALES', 'TECHNICIAN', 'EXPERT', 'BILLING')
+  findAll(@Req() req: any) {
+    return this.usersService.findAll(req.user);
   }
 
   @Get(':id')
   @UseGuards(RolesGuard)
-  @Roles('ADMIN', 'MANAGER')
-  findOne(@Param('id') id: string) {
-    return this.usersService.findOne(id);
+  @Roles('ADMIN', 'MANAGER', 'SALES', 'TECHNICIAN', 'EXPERT', 'BILLING')
+  findOne(@Param('id') id: string, @Req() req: any) {
+    return this.usersService.findOne(id, req.user);
   }
 
   @Post()
   @UseGuards(RolesGuard)
-  @Roles('ADMIN', 'MANAGER')
-  create(@Body() body: any) {
-    return this.usersService.create(body);
+  @Roles('ADMIN', 'MANAGER', 'SALES', 'TECHNICIAN', 'EXPERT', 'BILLING')
+  create(@Body() body: any, @Req() req: any) {
+    return this.usersService.create(body, req.user);
   }
 
   @Patch(':id')
   @UseGuards(RolesGuard)
-  @Roles('ADMIN', 'MANAGER')
-  update(@Param('id') id: string, @Body() body: any) {
-    return this.usersService.update(id, body);
+  @Roles('ADMIN', 'MANAGER', 'SALES', 'TECHNICIAN', 'EXPERT', 'BILLING')
+  update(@Param('id') id: string, @Body() body: any, @Req() req: any) {
+    return this.usersService.update(id, body, req.user);
   }
 
   @Patch(':id/presence')
@@ -52,25 +80,9 @@ export class UsersController {
 
   @Delete(':id')
   @UseGuards(RolesGuard)
-  @Roles('ADMIN', 'MANAGER')
-  remove(@Param('id') id: string) {
-    return this.usersService.remove(id);
-  }
-
-  @Post('login')
-  async login(@Body() body: any) {
-    const { email, password } = body || {};
-
-    if (!email || !password) {
-      throw new UnauthorizedException('Invalid credentials');
-    }
-
-    const user = await this.usersService.login(email, password);
-    if (!user) {
-      throw new UnauthorizedException('Invalid credentials');
-    }
-
-    return user;
+  @Roles('ADMIN', 'MANAGER', 'SALES', 'TECHNICIAN', 'EXPERT', 'BILLING')
+  remove(@Param('id') id: string, @Req() req: any) {
+    return this.usersService.remove(id, req.user);
   }
 }
 

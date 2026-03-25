@@ -1,8 +1,16 @@
+import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+    }),
+  );
 
   // Simple, stable CORS policy for Vercel + local dev.
   // Fixes cases where Render doesn't have CORS_ORIGIN set for the Vercel origin.
@@ -17,11 +25,14 @@ async function bootstrap() {
     // Allow explicit origins from env if provided.
     if (corsOriginsFromEnv.includes(origin)) return true;
 
-    // Local dev
+    // Local dev (hostname + 127.0.0.1 — avoids CORS "failed" when opening the app via 127.0.0.1)
     if (
       origin === 'http://localhost:3000' ||
       origin === 'http://localhost:3001' ||
-      origin === 'http://localhost:3002'
+      origin === 'http://localhost:3002' ||
+      origin === 'http://127.0.0.1:3000' ||
+      origin === 'http://127.0.0.1:3001' ||
+      origin === 'http://127.0.0.1:3002'
     ) {
       return true;
     }

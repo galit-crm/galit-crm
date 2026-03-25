@@ -15,9 +15,13 @@ import { SearchModule } from './search/search.module';
 import { DashboardModule } from './dashboard/dashboard.module';
 import { SettingsModule } from './settings/settings.module';
 import { QuoteItemCatalogModule } from './quote-item-catalog/quote-item-catalog.module';
+import { QuoteTemplatesModule } from './quote-templates/quote-templates.module';
+import { CustomerClassificationsModule } from './customer-classifications/customer-classifications.module';
+import { FollowupImportModule } from './followup-import/followup-import.module';
+import { AuthModule } from './auth/auth.module';
 
 @Module({
-  imports: [LeadsModule, UsersModule, CustomersModule, TasksModule, QuotesModule, ReportsModule, ProjectsModule, OpportunitiesModule, DocumentsModule, LabSamplesModule, SearchModule, DashboardModule, SettingsModule, QuoteItemCatalogModule],
+  imports: [AuthModule, LeadsModule, UsersModule, CustomersModule, CustomerClassificationsModule, TasksModule, QuotesModule, ReportsModule, ProjectsModule, OpportunitiesModule, DocumentsModule, LabSamplesModule, SearchModule, DashboardModule, SettingsModule, QuoteItemCatalogModule, QuoteTemplatesModule, FollowupImportModule],
   controllers: [AppController],
   providers: [AppService],
 })

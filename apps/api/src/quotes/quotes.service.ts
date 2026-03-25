@@ -1,12 +1,47 @@
 import { ForbiddenException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import * as fs from 'fs';
 import * as path from 'path';
 import PDFDocument = require('pdfkit');
 
+const QUOTE_WRITABLE_FIELDS = new Set([
+  'importLegacyId',
+  'quoteNumber',
+  'service',
+  'description',
+  'amount',
+  'status',
+  'validTo',
+  'pdfPath',
+  'customerId',
+  'leadId',
+  'projectId',
+  'opportunityId',
+  'validityDate',
+  'amountBeforeVat',
+  'vatPercent',
+  'discountType',
+  'discountValue',
+  'paymentTerms',
+  'notes',
+  'quoteTemplateId',
+  'contentHtml',
+  'lineItemsJson',
+]);
+
 @Injectable()
 export class QuotesService {
   constructor(private readonly prisma: PrismaService) {}
+
+  private sanitizeQuoteInput(data: any) {
+    if (!data || typeof data !== 'object') return {};
+    const out: Record<string, unknown> = {};
+    for (const k of QUOTE_WRITABLE_FIELDS) {
+      if (k in data && (data as any)[k] !== undefined) out[k] = (data as any)[k];
+    }
+    return out;
+  }
 
   private computeTotalAmount(input: {
     amountBeforeVat?: number | null;
@@ -42,33 +77,48 @@ export class QuotesService {
     if (!role) throw new UnauthorizedException('Missing role');
     if (role !== 'ADMIN' && role !== 'MANAGER' && role !== 'SALES') throw new ForbiddenException();
 
-    // Automation: expire quotes whose validity passed while still SENT
+    // Automation: expire quotes whose validity passed while still SENT (best-effort — older DBs may lack EXPIRED enum)
     const now = new Date();
-    await this.prisma.quote.updateMany({
-      where: {
-        status: 'SENT',
-        OR: [
-          { validityDate: { lt: now } },
-          { validTo: { lt: now } },
-        ],
-      },
-      data: { status: 'EXPIRED' },
-    });
+    try {
+      await this.prisma.quote.updateMany({
+        where: {
+          status: 'SENT',
+          OR: [
+            { validityDate: { lt: now } },
+            { validTo: { lt: now } },
+          ],
+        },
+        data: { status: 'EXPIRED' },
+      });
+    } catch {
+      /* ignore */
+    }
 
-    return this.prisma.quote.findMany({
-      where: {
-        ...(projectId ? { projectId } : {}),
-        ...(opportunityId ? { opportunityId } : {}),
-        ...(customerId ? { customerId } : {}),
-        ...(leadId ? { leadId } : {}),
-      },
-      orderBy: [{ createdAt: 'desc' }],
-      include: { customer: true, opportunity: true, project: true },
-    });
+    try {
+      return await this.prisma.quote.findMany({
+        where: {
+          ...(projectId ? { projectId } : {}),
+          ...(opportunityId ? { opportunityId } : {}),
+          ...(customerId ? { customerId } : {}),
+          ...(leadId ? { leadId } : {}),
+        },
+        orderBy: [{ createdAt: 'desc' }],
+        include: { customer: true, opportunity: true, project: true, quoteTemplate: true },
+      });
+    } catch (e) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2022') {
+        // Degraded list without joins — avoids 500 when schema/DB drift; client may refetch relations separately
+        return this.prisma.$queryRawUnsafe(`SELECT * FROM "Quote" ORDER BY "createdAt" DESC`);
+      }
+      throw e;
+    }
   }
 
   findOne(id: string) {
-    return this.prisma.quote.findUnique({ where: { id } });
+    return this.prisma.quote.findUnique({
+      where: { id },
+      include: { customer: true, quoteTemplate: true },
+    });
   }
 
   create(data: any, user?: { id?: string; role?: string }) {
@@ -76,16 +126,17 @@ export class QuotesService {
     if (!role) throw new UnauthorizedException('Missing role');
     if (role !== 'ADMIN' && role !== 'MANAGER' && role !== 'SALES') throw new ForbiddenException();
 
+    const clean = this.sanitizeQuoteInput(data);
     const totalAmount = this.computeTotalAmount({
-      amountBeforeVat: data?.amountBeforeVat,
-      vatPercent: data?.vatPercent,
-      discountType: data?.discountType,
-      discountValue: data?.discountValue,
+      amountBeforeVat: (clean as any)?.amountBeforeVat,
+      vatPercent: (clean as any)?.vatPercent,
+      discountType: (clean as any)?.discountType,
+      discountValue: (clean as any)?.discountValue,
     });
 
     return this.prisma.quote.create({
       data: {
-        ...data,
+        ...(clean as any),
         totalAmount,
       },
     });
@@ -102,7 +153,7 @@ export class QuotesService {
     });
     if (!existing) throw new NotFoundException('Quote not found');
 
-    const next: any = { ...data };
+    const next: any = { ...this.sanitizeQuoteInput(data) };
 
     // Always keep totalAmount in sync when financial fields change
     const willRecalc =
@@ -200,23 +251,35 @@ export class QuotesService {
         .text('גלית - הצעת מחיר', { align: 'right' })
         .moveDown();
 
+      const displayAmount =
+        Number(quote.totalAmount ?? quote.amountBeforeVat ?? quote.amount ?? 0) || 0;
+      const validUntil =
+        quote.validityDate ?? quote.validTo;
+
       // Quote / customer info
       doc
         .fontSize(12)
         .text(`מספר הצעה: ${quote.quoteNumber ?? quote.id}`, { align: 'right' })
         .text(`לקוח: ${quote.customer?.name ?? ''}`, { align: 'right' })
         .text(`שירות: ${quote.service}`, { align: 'right' })
-        .text(`סכום (₪): ${quote.amount.toLocaleString()}`, { align: 'right' })
+        .text(`סכום כולל (₪): ${displayAmount.toLocaleString('he-IL')}`, { align: 'right' })
         .text(`סטטוס: ${quote.status}`, { align: 'right' })
-        .text(`בתוקף עד: ${quote.validTo.toISOString().slice(0, 10)}`, { align: 'right' })
+        .text(
+          `בתוקף עד: ${validUntil ? new Date(validUntil).toISOString().slice(0, 10) : '—'}`,
+          { align: 'right' },
+        )
         .moveDown();
 
-      if (quote.description) {
+      const descriptionSource =
+        (quote as any).contentHtml && String((quote as any).contentHtml).trim()
+          ? String((quote as any).contentHtml).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+          : quote.description || '';
+      if (descriptionSource) {
         doc
           .fontSize(12)
           .text('תיאור השירות:', { align: 'right' })
           .moveDown(0.5)
-          .text(quote.description, { align: 'right' });
+          .text(descriptionSource.slice(0, 8000), { align: 'right' });
       }
 
       doc.end();

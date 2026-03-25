@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Post, Req, UseGuards } from '@nestjs/common';
 import { ProjectsService } from './projects.service';
 import { Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
@@ -6,6 +6,13 @@ import { RolesGuard } from '../auth/roles.guard';
 @Controller('projects')
 export class ProjectsController {
   constructor(private readonly projectsService: ProjectsService) {}
+
+  @Post()
+  @UseGuards(RolesGuard)
+  @Roles('ADMIN', 'MANAGER')
+  create(@Body() body: any, @Req() req: any) {
+    return this.projectsService.create(body, req.user);
+  }
 
   @Get()
   @UseGuards(RolesGuard)

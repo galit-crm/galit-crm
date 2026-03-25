@@ -8,7 +8,7 @@ export class OpportunitiesService {
   findAll(user?: { id?: string; role?: string }) {
     const role = (user?.role || '').toUpperCase();
     if (!role) throw new UnauthorizedException('Missing role');
-    if (role !== 'ADMIN' && role !== 'MANAGER' && role !== 'SALES') throw new ForbiddenException();
+    if (!['ADMIN', 'MANAGER', 'SALES', 'EXPERT'].includes(role)) throw new ForbiddenException();
     return this.prisma.opportunity.findMany({
       include: {
         customer: { select: { id: true, name: true } },
@@ -22,7 +22,7 @@ export class OpportunitiesService {
   findOne(id: string, user?: { id?: string; role?: string }) {
     const role = (user?.role || '').toUpperCase();
     if (!role) throw new UnauthorizedException('Missing role');
-    if (role !== 'ADMIN' && role !== 'MANAGER' && role !== 'SALES') throw new ForbiddenException();
+    if (!['ADMIN', 'MANAGER', 'SALES', 'EXPERT'].includes(role)) throw new ForbiddenException();
     return this.prisma.opportunity.findUnique({
       where: { id },
       include: {
@@ -37,21 +37,21 @@ export class OpportunitiesService {
   create(data: any, user?: { id?: string; role?: string }) {
     const role = (user?.role || '').toUpperCase();
     if (!role) throw new UnauthorizedException('Missing role');
-    if (role !== 'ADMIN' && role !== 'MANAGER' && role !== 'SALES') throw new ForbiddenException();
+    if (!['ADMIN', 'MANAGER', 'SALES', 'EXPERT'].includes(role)) throw new ForbiddenException();
     return this.prisma.opportunity.create({ data });
   }
 
   update(id: string, data: any, user?: { id?: string; role?: string }) {
     const role = (user?.role || '').toUpperCase();
     if (!role) throw new UnauthorizedException('Missing role');
-    if (role !== 'ADMIN' && role !== 'MANAGER' && role !== 'SALES') throw new ForbiddenException();
+    if (!['ADMIN', 'MANAGER', 'SALES', 'EXPERT'].includes(role)) throw new ForbiddenException();
     return this.prisma.opportunity.update({ where: { id }, data });
   }
 
   remove(id: string, user?: { id?: string; role?: string }) {
     const role = (user?.role || '').toUpperCase();
     if (!role) throw new UnauthorizedException('Missing role');
-    if (role !== 'ADMIN' && role !== 'MANAGER' && role !== 'SALES') throw new ForbiddenException();
+    if (!['ADMIN', 'MANAGER', 'SALES', 'EXPERT'].includes(role)) throw new ForbiddenException();
     return this.prisma.opportunity.delete({ where: { id } });
   }
 }

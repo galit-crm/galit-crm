@@ -3,6 +3,8 @@ import { QuotesService } from './quotes.service';
 import { Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { Response } from 'express';
+import * as path from 'path';
+import * as fs from 'fs';
 
 @Controller('quotes')
 @UseGuards(RolesGuard)
@@ -44,7 +46,12 @@ export class QuotesController {
       return;
     }
 
-    res.sendFile(quote.pdfPath, { root: process.cwd() });
+    const absolute = path.join(process.cwd(), quote.pdfPath);
+    if (!fs.existsSync(absolute)) {
+      res.status(404).send('PDF file missing on disk');
+      return;
+    }
+    res.sendFile(absolute);
   }
 
   @Patch(':id')

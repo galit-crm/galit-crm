@@ -9,9 +9,10 @@ datasource db {
 model User {
   id           String      @id @default(uuid())
   name         String
-  email        String      @unique
-  passwordHash String
-  role         UserRole    @default(SALES)
+  email    String   @unique
+  /// Bcrypt hash; DB column remains "passwordHash" for existing migrations.
+  password String   @map("passwordHash")
+  role     UserRole @default(SALES)
   status       UserStatus  @default(ACTIVE)
   phone        String?
   department   String?
@@ -19,6 +20,15 @@ model User {
   serviceDepartments String[] @default([])
   createdAt    DateTime    @default(now())
   updatedAt    DateTime    @updatedAt
+
+  // Basic per-user permissions overrides (stage 1 of permissions system)
+  canViewFinance         Boolean @default(false)
+  canEditFinance         Boolean @default(false)
+  canDeleteCustomers     Boolean @default(false)
+  canDeleteLeads         Boolean @default(false)
+  canManageUsers         Boolean @default(false)
+  canManagePermissions   Boolean @default(false)
+  canViewAllRecords      Boolean @default(false)
 
   ownedLeads       Lead[]    @relation("LeadAssignedUser")
   tasks            Task[]    @relation("TaskOwner")
@@ -43,6 +53,8 @@ model User {
 
 model Project {
   id                    String         @id @default(uuid())
+  /// מזהה ייחודי מהמערכת המיובאת (לקישור בין ישויות בייבוא)
+  importLegacyId        String?
   projectNumber         String?
   name                  String
   client                String
@@ -86,21 +98,115 @@ model Project {
   activeUsers           User[]         @relation("UserCurrentProject")
 
   leads                 Lead[]
+
+  @@index([importLegacyId])
+}
+
+model CustomerClassification {
+  id        String   @id @default(uuid())
+  code      String   @unique
+  labelHe   String
+  sortOrder Int      @default(0)
+  isPreset  Boolean  @default(false)
+  createdAt DateTime @default(now())
 }
 
 model Customer {
   id          String         @id @default(uuid())
+  /// מזהה מהמערכת המיובאת (לקישור בין לידים/דוחות/פרויקטים)
+  importLegacyId String?
   name        String
-  type        CustomerType
+  /// סיווג לקוח: קוד מתוך CustomerClassification (למשל COMPANY / C_...)
+  type        String
   contactName String
   phone       String
   email       String
   city        String
+  address     String?
   status      String         @default("ACTIVE")
   services    String[]
   notes       String?
+  /// שדות מיובאים Followup / מערכת ישנה
+  phone2           String?
+  phone3           String?
+  fax              String?
+  website          String?
+  companyRegNumber String?
+  internalNotes    String?    @db.Text
+  balanceLegacy    Decimal?   @db.Decimal(18, 2)
+  birthdayLegacy   DateTime?
+  cityCodeLegacy   String?
+  zipLegacy        String?
+  legacyUpdatedAt  DateTime?
   createdAt   DateTime       @default(now())
   updatedAt   DateTime       @updatedAt
+
+  /// Legacy customer card — general / account
+  legacyAccountNumber         String?
+  legacySubClassificationCode String?
+  salesRepresentative         String?
+  functionalLabel             String?
+  customerSize                String?
+  managementProfile           String?
+  countryOrRegion             String?
+
+  /// Legacy card — mailing (פרטי דיוור)
+  mailingAddress      String?
+  mailingCity         String?
+  mailingZip          String?
+  mailingPoBox        String?
+  mailingInvalidField String?
+  allowMail           Boolean?
+  allowFax            Boolean?
+  allowEmail          Boolean?
+  allowSms            Boolean?
+  mailingNote         String? @db.Text
+
+  /// Legacy card — notes tab metadata
+  registrationDate DateTime?
+  registrationNote String?   @db.Text
+  lastUpdateDate   DateTime?
+  lastUpdateNote   String?   @db.Text
+  lastUpdatedBy    String?
+
+  /// Legacy card — financial (single record on customer)
+  priceList               String?
+  roundedPricing          String?
+  employeeCount           String?
+  managementCustomerLabel String?
+  financialNumber1        String?
+  financialNumber2        String?
+  financialNumber2Large   String?
+  financialNumber3        String?
+  financeToken            String?
+  financeTokenDate        DateTime?
+  financeTokenActive      Boolean?
+  financeUnnamed1         String?
+  financeUnnamed2         String?
+  financeUnnamed3         String?
+  financeUnnamed4         String?
+  totalPurchases          Decimal? @db.Decimal(18, 2)
+  totalSales              Decimal? @db.Decimal(18, 2)
+  percentageValue         Decimal? @db.Decimal(18, 4)
+  paymentTerms            String?
+  creditDays              String?
+  creditEnabled           Boolean?
+  creditNumber            String?
+  creditExpiry            String?
+
+  /// Legacy card — פרטים נוספים
+  microwaveModel   String?
+  detectorLocation String?
+  companyAmount    String?
+  feature7         String?
+  detailDate1      DateTime?
+  detailDate3      DateTime?
+  detectorModel    String?
+  feature4         String?
+  companyWall      String?
+  feature8         String?
+  detailDate2      DateTime?
+  detailDate4      DateTime?
 
   leads       Lead[]
   quotes      Quote[]
@@ -110,10 +216,227 @@ model Customer {
   opportunities Opportunity[]
   documents   Document[]
   labSamples  LabSample[]
+  contacts         CustomerContact[]
+  salesOrders      SalesOrder[]
+  interactions     CustomerInteraction[]
+  referralSources        CustomerReferralSource[]
+  customerQuestionnaires CustomerQuestionnaire[]
+  customerRelations      CustomerRelation[]
+  additionalDataRows     CustomerAdditionalDataRow[]
+  externalDataRows       CustomerExternalDataRow[]
+
+  @@index([importLegacyId])
+  @@index([name])
+  @@index([phone])
+}
+
+/// מקור הגעה (טאב מקור הגעה)
+model CustomerReferralSource {
+  id             String    @id @default(uuid())
+  customerId     String
+  customer       Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  date           DateTime?
+  sourceName     String?
+  rowOrder       Int       @default(0)
+  importLegacyId String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([customerId])
+}
+
+/// שאלונים (טאב שאלונים)
+model CustomerQuestionnaire {
+  id                String   @id @default(uuid())
+  customerId        String
+  customer          Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  questionnaireCode String?
+  questionnaireName String?
+  rowOrder          Int      @default(0)
+  importLegacyId    String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([customerId])
+}
+
+/// קשרים ללקוחות אחרים (טאב קשרים)
+model CustomerRelation {
+  id                  String   @id @default(uuid())
+  customerId          String
+  customer            Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  relatedCustomerName String?
+  relationType        String?
+  rowOrder            Int      @default(0)
+  importLegacyId      String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([customerId])
+}
+
+/// נתונים נוספים — שורות גנריות
+model CustomerAdditionalDataRow {
+  id             String    @id @default(uuid())
+  customerId     String
+  customer       Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  numberValue    String?
+  dValue         String?
+  dateValue      DateTime?
+  text1          String?
+  text2          String?
+  rowOrder       Int       @default(0)
+  importLegacyId String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([customerId])
+}
+
+/// נתונים חיצוניים — עמודות A–J
+model CustomerExternalDataRow {
+  id             String   @id @default(uuid())
+  customerId     String
+  customer       Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  rowOrder       Int      @default(0)
+  colA           String?
+  colB           String?
+  colC           String?
+  colD           String?
+  colE           String?
+  colF           String?
+  colG           String?
+  colH           String?
+  colI           String?
+  colJ           String?
+  importLegacyId String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([customerId])
+}
+
+/// איש קשר (Followup: ISH_KESHER)
+model CustomerContact {
+  id             String   @id @default(uuid())
+  /// מזהה ייחודי בייבוא: לרוב Code_Ish_Kesher או customerCode|contactCode
+  importLegacyId String
+  customerId     String
+  customer       Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  fullName       String
+  phone          String   @default("")
+  mobile         String   @default("")
+  fax            String   @default("")
+  email          String   @default("")
+  address        String   @default("")
+  city           String   @default("")
+  zip            String   @default("")
+  roleTitle      String?
+  department     String?
+  isPrimary      Boolean  @default(false)
+  isActive       Boolean  @default(true)
+  notes          String?  @db.Text
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  quotes       Quote[]
+  salesOrders  SalesOrder[]
+  interactions CustomerInteraction[]
+
+  @@unique([customerId, importLegacyId])
+  @@index([importLegacyId])
+}
+
+/// הזמנה (Followup: ORDERS) — נפרד מ-Quote
+model SalesOrder {
+  id                  String   @id @default(uuid())
+  importLegacyId      String?  @unique
+  orderNumber         String?
+  customerId          String
+  customer            Customer @relation(fields: [customerId], references: [id])
+  customerContactId   String?
+  contact             CustomerContact? @relation(fields: [customerContactId], references: [id])
+  quoteId             String?
+  quote               Quote?   @relation(fields: [quoteId], references: [id])
+  status              String   @default("IMPORTED")
+  orderDate           DateTime?
+  total               Float    @default(0)
+  notes               String?  @db.Text
+  internalNotes       String?  @db.Text
+  deliverySummary     String?  @db.Text
+  paymentTerms        String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([customerId])
+  @@index([importLegacyId])
+}
+
+/// פעילות / התקשרות (Followup: HITKASHRUT)
+model CustomerInteraction {
+  id                  String   @id @default(uuid())
+  importLegacyId      String?  @unique
+  customerId          String
+  customer            Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customerContactId   String?
+  contact             CustomerContact? @relation(fields: [customerContactId], references: [id])
+  activityType        String?
+  status              String?
+  subject             String?
+  notes               String?  @db.Text
+  dueDate             DateTime?
+  completedDate       DateTime?
+  activityDate        DateTime?
+  legacyOwnerName     String?
+  location            String?
+  priority            String?
+  createdAt           DateTime @default(now())
+
+  @@index([customerId])
+  @@index([importLegacyId])
+}
+
+enum ImportJobStatus {
+  UPLOADED
+  PREVIEW_READY
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+model ImportJob {
+  id           String          @id @default(uuid())
+  fileName     String
+  mimeType     String?
+  fileType     String
+  status       ImportJobStatus @default(UPLOADED)
+  storedPath   String?
+  userId       String?
+  previewJson  Json?
+  resultJson   Json?
+  errorMessage String?         @db.Text
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  errors ImportJobError[]
+}
+
+model ImportJobError {
+  id        String    @id @default(uuid())
+  jobId     String
+  job       ImportJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  entity    String
+  lineRef   String?
+  message   String
+  rowData   Json?
+  createdAt DateTime  @default(now())
+
+  @@index([jobId])
 }
 
 model Lead {
   id             String      @id @default(uuid())
+  importLegacyId String?
   // Legacy fields (kept for backwards compatibility with existing UI/API)
   firstName      String
   lastName       String?
@@ -159,6 +482,8 @@ model Lead {
   project        Project?    @relation(fields: [projectId], references: [id])
 
   activities     LeadActivity[]
+
+  @@index([importLegacyId])
 }
 
 model LeadActivity {
@@ -203,8 +528,33 @@ model Opportunity {
   quotes               Quote[]
 }
 
+/// תבנית HTML להצעות מחיר לפי סוג שירות (מנגנון מודרני — ללא Word)
+model QuoteTemplate {
+  id              String   @id @default(uuid())
+  name            String
+  /// התאמה לשדה Quote.service / בחירת שירות בטופס (מחרוזת זהה)
+  serviceType     String
+  isActive        Boolean  @default(true)
+  introHtml       String?  @db.Text
+  bodyHtml        String?  @db.Text
+  closingHtml     String?  @db.Text
+  termsHtml       String?  @db.Text
+  /// טקסט עזר למנהלים: רשימת משתני {{...}} (אופציונלי)
+  variablesHelp   String?  @db.Text
+  /// מערך: { name, quantity, unitPrice }[]
+  defaultLineItems Json?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  quotes Quote[]
+
+  @@index([serviceType])
+  @@index([isActive])
+}
+
 model Quote {
   id          String       @id @default(uuid())
+  importLegacyId String?
   quoteNumber String?
   service     String
   description String?
@@ -218,6 +568,9 @@ model Quote {
 
   customerId  String
   customer    Customer     @relation(fields: [customerId], references: [id])
+
+  customerContactId String?
+  customerContact   CustomerContact? @relation(fields: [customerContactId], references: [id])
 
   leadId      String?
   lead        Lead?        @relation(fields: [leadId], references: [id])
@@ -249,6 +602,17 @@ model Quote {
   digitalCertificateMeta  Json?
   signatureRequestedAt    DateTime?
   signedAt                DateTime?
+
+  quoteTemplateId String?
+  quoteTemplate   QuoteTemplate? @relation(fields: [quoteTemplateId], references: [id], onDelete: SetNull)
+  /// גוף HTML ממוזג לתצוגה מקדימה / PDF עתידי
+  contentHtml     String? @db.Text
+  /// פריטי שורה שנשמרו מהתבנית/עריכה
+  lineItemsJson   Json?
+
+  salesOrders SalesOrder[]
+
+  @@index([importLegacyId])
 }
 
 model Task {
@@ -277,6 +641,7 @@ model Task {
 
 model Report {
   id          String      @id @default(uuid())
+  importLegacyId String?
   projectId      String?
   project        Project?    @relation(fields: [projectId], references: [id])
 
@@ -307,14 +672,20 @@ model Report {
   documents      Document[]
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
+
+  @@index([importLegacyId])
 }
 
 model Document {
   id            String       @id @default(uuid())
+  importLegacyId String?
   name          String
   documentType  DocumentType @default(OTHER)
   filePath      String
   description   String?
+  mimeType      String?
+  sizeBytes     Int?
+  documentDate  DateTime?
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
 
@@ -329,6 +700,8 @@ model Document {
 
   uploadedById  String?
   uploadedBy    User?        @relation("DocumentUploader", fields: [uploadedById], references: [id])
+
+  @@index([importLegacyId])
 }
 
 model LabSample {
@@ -455,12 +828,6 @@ enum UserRole {
 enum UserStatus {
   ACTIVE
   INACTIVE
-}
-
-enum CustomerType {
-  COMPANY
-  PUBLIC
-  PRIVATE
 }
 
 enum LeadStage {

@@ -1,21 +1,94 @@
 import { BadRequestException, ForbiddenException, Injectable, UnauthorizedException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { Prisma, UserRole, UserStatus, WorkMode } from '@prisma/client';
+import { Prisma, User, UserRole, UserStatus, WorkMode, WorkStatus } from '@prisma/client';
+import * as bcrypt from 'bcryptjs';
 
 @Injectable()
 export class UsersService {
   constructor(private readonly prisma: PrismaService) {}
 
-  findAll() {
-    return this.prisma.user.findMany();
+  private async assertCanManageUsers(actor?: { id?: string; role?: string }) {
+    const role = (actor?.role || '').toUpperCase();
+    if (!role) throw new UnauthorizedException('Missing role');
+
+    // Role-based fallback (stage 1 operational behavior).
+    if (role === 'ADMIN' || role === 'MANAGER') return;
+
+    const userId = actor?.id;
+    if (!userId) throw new UnauthorizedException('Missing user id');
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, canManageUsers: true },
+    });
+
+    if (!user?.canManageUsers) throw new ForbiddenException();
   }
 
-  findOne(id: string) {
-    return this.prisma.user.findUnique({ where: { id } });
+  /**
+   * List users for UI (dropdowns, admin screens). Access is enforced by RolesGuard on the controller.
+   * Does not require canManageUsers — that flag applies to destructive/admin mutations only.
+   * Omits password; falls back to raw SQL if Prisma schema is ahead of DB (P2022).
+   */
+  async findAll(_actor?: { id?: string; role?: string }) {
+    try {
+      return await this.prisma.user.findMany({
+        omit: { password: true },
+      });
+    } catch (e) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2022') {
+        const rows = await this.prisma.$queryRawUnsafe<Record<string, unknown>[]>(`SELECT * FROM "User"`);
+        return rows.map((r) => {
+          const u = this.normalizeUserRow(r);
+          const { password: _omit, ...safe } = u;
+          return safe;
+        });
+      }
+      throw e;
+    }
   }
 
-  async create(data: any) {
-    const { password, role, status, phone, department, serviceDepartments, ...rest } = data || {};
+  async findOne(id: string, _actor?: { id?: string; role?: string }) {
+    try {
+      return await this.prisma.user.findUnique({
+        where: { id },
+        omit: { password: true },
+      });
+    } catch (e) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2022') {
+        const rows = await this.prisma.$queryRawUnsafe<Record<string, unknown>[]>(
+          `SELECT * FROM "User" WHERE id = $1 LIMIT 1`,
+          id,
+        );
+        const row = rows[0];
+        if (!row) return null;
+        const u = this.normalizeUserRow(row);
+        const { password: _omit, ...safe } = u;
+        return safe;
+      }
+      throw e;
+    }
+  }
+
+  async create(data: any, actor?: { id?: string; role?: string }) {
+    await this.assertCanManageUsers(actor);
+
+    const {
+      password,
+      role,
+      status,
+      phone,
+      department,
+      serviceDepartments,
+      canViewFinance,
+      canEditFinance,
+      canDeleteCustomers,
+      canDeleteLeads,
+      canManageUsers,
+      canManagePermissions,
+      canViewAllRecords,
+      ...rest
+    } = data || {};
 
     if (!password || !rest?.email || !rest?.name) {
       throw new BadRequestException('שם, אימייל וסיסמה הם שדות חובה.');
@@ -32,19 +105,31 @@ export class UsersService {
         ? [String(department)]
         : [];
 
+    const hashedPassword = await bcrypt.hash(String(password), 10);
+
     const payload: Prisma.UserCreateInput = {
       name: rest.name,
       email: rest.email,
-      passwordHash: password,
+      password: hashedPassword,
       role: normalizedRole,
       status: normalizedStatus,
       phone: phone ?? null,
       department: department ?? normalizedServiceDepartments[0] ?? null,
       serviceDepartments: normalizedServiceDepartments,
+      canViewFinance: !!canViewFinance,
+      canEditFinance: !!canEditFinance,
+      canDeleteCustomers: !!canDeleteCustomers,
+      canDeleteLeads: !!canDeleteLeads,
+      canManageUsers: !!canManageUsers,
+      canManagePermissions: !!canManagePermissions,
+      canViewAllRecords: !!canViewAllRecords,
     };
 
     try {
-      return await this.prisma.user.create({ data: payload });
+      return await this.prisma.user.create({
+        data: payload,
+        omit: { password: true },
+      });
     } catch (e: any) {
       // eslint-disable-next-line no-console
       console.error('UsersService.create error:', e);
@@ -60,8 +145,18 @@ export class UsersService {
     }
   }
 
-  update(id: string, data: any) {
+  async update(id: string, data: any, actor?: { id?: string; role?: string }) {
+    await this.assertCanManageUsers(actor);
+
     const normalized: any = { ...(data || {}) };
+    if ('password' in normalized) {
+      const p = normalized.password;
+      if (p === undefined || p === null || String(p).trim() === '') {
+        delete normalized.password;
+      } else {
+        normalized.password = await bcrypt.hash(String(p), 10);
+      }
+    }
     if ('serviceDepartments' in normalized) {
       normalized.serviceDepartments = Array.isArray(normalized.serviceDepartments)
         ? normalized.serviceDepartments.map((x: any) => String(x)).filter(Boolean)
@@ -72,18 +167,160 @@ export class UsersService {
     return this.prisma.user.update({ where: { id }, data: normalized });
   }
 
-  remove(id: string) {
-    return this.prisma.user.delete({ where: { id } });
+  async remove(id: string, actor?: { id?: string; role?: string }) {
+    await this.assertCanManageUsers(actor);
+    /** לא מוחקים רשומת משתמש — רק מסמנים כלא פעיל (לא יכול להתחבר) */
+    return this.prisma.user.update({
+      where: { id },
+      data: { status: UserStatus.INACTIVE },
+    });
   }
 
-  async login(email: string, password: string) {
-    return this.prisma.user.findFirst({
-      where: {
-        email,
-        passwordHash: password,
-        status: UserStatus.ACTIVE,
+  /** העברת שיוכים בין עובדים (מנהלים בלבד) */
+  async transferAssignments(
+    fromUserId: string,
+    toUserId: string,
+    options: {
+      leads?: boolean;
+      customers?: boolean;
+      tasks?: boolean;
+      projects?: boolean;
+      quotes?: boolean;
+      /** לא בשימוש — פעילויות שומרות createdById כהיסטוריה */
+      activities?: boolean;
+    },
+    actor?: { id?: string; role?: string },
+  ) {
+    await this.assertCanManageUsers(actor);
+    if (!fromUserId || !toUserId || fromUserId === toUserId) {
+      throw new BadRequestException('יש לבחור עובד מקור ויעד שונים');
+    }
+    const [from, to] = await Promise.all([
+      this.prisma.user.findUnique({ where: { id: fromUserId }, select: { id: true } }),
+      this.prisma.user.findUnique({ where: { id: toUserId }, select: { id: true } }),
+    ]);
+    if (!from || !to) throw new BadRequestException('משתמש לא נמצא');
+
+    const counts: Record<string, number> = {};
+
+    await this.prisma.$transaction(async (tx) => {
+      if (options.leads) {
+        const r = await tx.lead.updateMany({
+          where: { assignedUserId: fromUserId },
+          data: { assignedUserId: toUserId },
+        });
+        counts.leads = r.count;
+      }
+      if (options.customers) {
+        /** "לקוחות" = הזדמנויות מכירה משויכות לעובד (אין owner ישיר על Customer) */
+        const r = await tx.opportunity.updateMany({
+          where: { assignedUserId: fromUserId },
+          data: { assignedUserId: toUserId },
+        });
+        counts.customers = r.count;
+      } else if (options.quotes) {
+        /** "הצעות מחיר" = הזדמנויות שיש להן לפחות הצעת מחיר אחת */
+        const quoteOpps = await tx.quote.findMany({
+          where: { opportunityId: { not: null } },
+          select: { opportunityId: true },
+          distinct: ['opportunityId'],
+        });
+        const ids = quoteOpps.map((q) => q.opportunityId).filter(Boolean) as string[];
+        if (ids.length) {
+          const r = await tx.opportunity.updateMany({
+            where: { id: { in: ids }, assignedUserId: fromUserId },
+            data: { assignedUserId: toUserId },
+          });
+          counts.quotes = r.count;
+        } else {
+          counts.quotes = 0;
+        }
+      }
+      if (options.tasks) {
+        const r = await tx.task.updateMany({
+          where: { ownerId: fromUserId },
+          data: { ownerId: toUserId },
+        });
+        counts.tasks = r.count;
+      }
+      if (options.projects) {
+        const a = await tx.project.updateMany({
+          where: { assignedTechnicianId: fromUserId },
+          data: { assignedTechnicianId: toUserId },
+        });
+        const b = await tx.project.updateMany({
+          where: { assignedReportWriterId: fromUserId },
+          data: { assignedReportWriterId: toUserId },
+        });
+        counts.projects = a.count + b.count;
+      }
+      /** לא מעדכנים LeadActivity.createdById — שומרים יוצר היסטורי */
+      if (options.activities) {
+        counts.activities = 0;
+      }
+    });
+
+    return { ok: true, counts };
+  }
+
+  /** העתקת תפקיד והרשאות משדות מעובד קיים */
+  async copyPermissionsFromUser(fromUserId: string, toUserId: string, actor?: { id?: string; role?: string }) {
+    await this.assertCanManageUsers(actor);
+    if (!fromUserId || !toUserId || fromUserId === toUserId) {
+      throw new BadRequestException('יש לבחור עובד מקור ויעד שונים');
+    }
+    const from = await this.prisma.user.findUnique({ where: { id: fromUserId } });
+    if (!from) throw new BadRequestException('משתמש מקור לא נמצא');
+
+    return this.prisma.user.update({
+      where: { id: toUserId },
+      data: {
+        role: from.role,
+        canViewFinance: from.canViewFinance,
+        canEditFinance: from.canEditFinance,
+        canDeleteCustomers: from.canDeleteCustomers,
+        canDeleteLeads: from.canDeleteLeads,
+        canManageUsers: from.canManageUsers,
+        canManagePermissions: from.canManagePermissions,
+        canViewAllRecords: from.canViewAllRecords,
+        serviceDepartments: [...(from.serviceDepartments || [])],
+        department: from.department ?? null,
       },
     });
+  }
+
+  /**
+   * Map a raw DB row to User when some Prisma columns were missing before migration
+   * (defaults match schema.prisma).
+   */
+  private normalizeUserRow(row: Record<string, unknown>): User {
+    const r = row as Record<string, any>;
+    const d = (v: unknown) => (v instanceof Date ? v : v ? new Date(v as string | number) : null);
+    return {
+      id: r.id,
+      name: r.name,
+      email: r.email,
+      password: String(r.passwordHash ?? r.password ?? ''),
+      role: r.role as UserRole,
+      status: r.status as UserStatus,
+      phone: r.phone ?? null,
+      department: r.department ?? null,
+      serviceDepartments: Array.isArray(r.serviceDepartments) ? r.serviceDepartments : [],
+      createdAt: d(r.createdAt) ?? new Date(),
+      updatedAt: d(r.updatedAt) ?? new Date(),
+      canViewFinance: Boolean(r.canViewFinance ?? false),
+      canEditFinance: Boolean(r.canEditFinance ?? false),
+      canDeleteCustomers: Boolean(r.canDeleteCustomers ?? false),
+      canDeleteLeads: Boolean(r.canDeleteLeads ?? false),
+      canManageUsers: Boolean(r.canManageUsers ?? false),
+      canManagePermissions: Boolean(r.canManagePermissions ?? false),
+      canViewAllRecords: Boolean(r.canViewAllRecords ?? false),
+      workStatus: (r.workStatus as WorkStatus) ?? WorkStatus.OFFLINE,
+      isOnline: Boolean(r.isOnline ?? false),
+      lastSeenAt: r.lastSeenAt ? d(r.lastSeenAt) : null,
+      currentWorkMode: (r.currentWorkMode as WorkMode | null) ?? null,
+      currentProjectId: r.currentProjectId ?? null,
+    } as User;
   }
 
   async updatePresence(
