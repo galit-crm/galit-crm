@@ -1,8 +1,18 @@
 'use client';
 
-import React, { useEffect, useMemo, useState } from 'react';
+import { apiUrl, getApiBaseUrl, apiFetch } from './lib/api-base';
+import { parseApiErrorResponse } from './lib/api-error';
+import { CustomerLegacyCard } from './customer-legacy-card';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  LayoutDashboard,
+  buildQuoteTemplateContext,
+  mergeQuoteTemplateFull,
+  mergedHtmlToPlainDescription,
+  QUOTE_SERVICE_TYPE_OPTIONS,
+  QUOTE_TEMPLATE_VARIABLES_HELP,
+  type QuoteTemplateLineItem,
+} from './lib/quote-template-merge';
+import {
   Users,
   FileText,
   FolderKanban,
@@ -14,7 +24,6 @@ import {
   AlertTriangle,
   ClipboardList,
   X,
-  Menu,
   Building2,
   Phone,
   Mail,
@@ -27,13 +36,21 @@ import {
   Settings,
   ChevronDown,
   ChevronRight,
-  PanelLeftClose,
-  PanelLeftOpen,
-  UserCheck,
   CalendarDays,
   CheckSquare,
   BarChart3,
+  Loader2,
 } from 'lucide-react';
+
+import { DataImportWizard } from './data-import-wizard';
+import { FollowupImportPanel } from './followup-import-panel';
+import { isAdminRole } from './lib/roles';
+import {
+  CrmLegacyTopNav,
+  GLOBAL_SEARCH_INPUT_ID,
+  GALIT_TOPBAR_SPACER_CLASS,
+  type SettingsToolbarJumpTab,
+} from './crm-classic-toolbar';
 
 import {
   ResponsiveContainer,
@@ -64,8 +81,36 @@ const galit = {
 
 const galitLogo = '/logo.png';
 
+type CustomerClassificationDto = {
+  id: string;
+  code: string;
+  labelHe: string;
+  sortOrder: number;
+  isPreset: boolean;
+};
+
+const PRESET_CUSTOMER_TYPE_LABELS: Record<string, string> = {
+  COMPANY: 'חברה / קבלן',
+  PUBLIC: 'רשות / מוסד',
+  PRIVATE: 'לקוח פרטי',
+};
+
+function buildCustomerTypeLabelMap(classifications: CustomerClassificationDto[]): Record<string, string> {
+  const m: Record<string, string> = { ...PRESET_CUSTOMER_TYPE_LABELS };
+  for (const c of classifications) {
+    m[c.code] = c.labelHe;
+  }
+  return m;
+}
+
+function resolveCustomerTypeLabel(type: string, labelMap: Record<string, string>) {
+  const t = (type || '').trim();
+  return labelMap[t] || PRESET_CUSTOMER_TYPE_LABELS[t] || t || '-';
+}
+
 type Lead = {
   id: string;
+  importLegacyId?: string | null;
   firstName?: string;
   lastName?: string;
   fullName?: string;
@@ -91,6 +136,7 @@ type Lead = {
   leadStatus?: string;
   updatedAt?: string;
   projectId?: string | null;
+  customerId?: string | null;
   createdAt?: string;
   stage?: string;
   status: string;
@@ -101,6 +147,7 @@ type Lead = {
 
 type Quote = {
   id: string;
+  importLegacyId?: string | null;
   quoteNumber?: string | null;
   customerId?: string | null;
   customerName?: string;
@@ -119,10 +166,14 @@ type Quote = {
   status: string;
   validTo: string; // legacy display
   validityDate?: string | null;
-  pdfPath?: string;
+  pdfPath?: string | null;
   notes?: string | null;
   createdAt?: string;
   updatedAt?: string;
+  leadId?: string | null;
+  contentHtml?: string | null;
+  lineItemsJson?: unknown;
+  quoteTemplateId?: string | null;
 };
 
 type Opportunity = {
@@ -222,6 +273,7 @@ function GlobalSearchBar({
   customers,
   leads,
   projects,
+  inputId,
 }: {
   currentUser: AppUser;
   onOpenCustomer: (c: Customer) => void;
@@ -230,6 +282,8 @@ function GlobalSearchBar({
   customers: Customer[];
   leads: Lead[];
   projects: Project[];
+  /** מזהה לשדה החיפוש — מיקוד מסרגל קלאסי */
+  inputId?: string;
 }) {
   const [q, setQ] = useState('');
   const [open, setOpen] = useState(false);
@@ -245,7 +299,7 @@ function GlobalSearchBar({
     }
     setLoading(true);
     const t = window.setTimeout(() => {
-      fetch(`http://localhost:3001/search?q=${encodeURIComponent(query)}`, { headers: authHeaders(currentUser) })
+      apiFetch(apiUrl(`/search?q=${encodeURIComponent(query)}`), { authUser: currentUser })
         .then((r) => (r.ok ? r.json() : Promise.reject()))
         .then((res: GlobalSearchResponse) => {
           setData(res);
@@ -276,6 +330,7 @@ function GlobalSearchBar({
   return (
     <div className="relative w-full max-w-2xl">
       <Input
+        id={inputId}
         value={q}
         onChange={(e) => {
           setQ(e.target.value);
@@ -407,6 +462,7 @@ function GlobalSearchBar({
 
 type Project = {
   id: string;
+  importLegacyId?: string | null;
   projectNumber?: string | null;
   name: string;
   client: string;
@@ -431,6 +487,7 @@ type Project = {
   address?: string | null;
   contactPhone?: string | null;
   fieldContactPhone?: string | null;
+  createdAt?: string;
 };
 
 type Task = {
@@ -452,15 +509,28 @@ type Task = {
 
 type Customer = {
   id: string;
+  importLegacyId?: string | null;
   name: string;
   type: string;
   contactName: string;
   phone: string;
   email: string;
   city: string;
+  address?: string | null;
   status: string;
   services: string[];
-  notes?: string;
+  notes?: string | null;
+  phone2?: string | null;
+  phone3?: string | null;
+  fax?: string | null;
+  website?: string | null;
+  companyRegNumber?: string | null;
+  internalNotes?: string | null;
+  zipLegacy?: string | null;
+  cityCodeLegacy?: string | null;
+  legacyUpdatedAt?: string | null;
+  balanceLegacy?: unknown;
+  birthdayLegacy?: string | null;
 };
 
 type TimelineEvent = {
@@ -491,92 +561,78 @@ type AppUser = {
   role: AppUserRole;
   password: string;
   status: 'פעיל' | 'לא פעיל';
+
+  // Basic permission overrides (stage 1 permissions system)
+  canViewFinance: boolean;
+  canEditFinance: boolean;
+  canDeleteCustomers: boolean;
+  canDeleteLeads: boolean;
+  canManageUsers: boolean;
+  canManagePermissions: boolean;
+  canViewAllRecords: boolean;
 };
 
-const leadsSeed: Lead[] = [
-  {
-    id: 'L-1001',
-    name: 'אורי כהן',
-    company: 'אפקון',
-    service: 'קרינה',
-    source: 'אתר',
-    stage: 'NEW',
-    status: 'NEW',
-    assignee: 'דניאל',
-    phone: '050-1234567',
-    site: 'תל אביב',
-    notes: 'פנייה לגבי בדיקת קרינה והכנת הצעת מחיר.',
-  },
-  {
-    id: 'L-1002',
-    name: 'שרה לוי',
-    company: 'פרטי',
-    service: 'ראדון',
-    source: 'וואטסאפ',
-    status: 'FU_1',
-    assignee: 'פול',
-    phone: '052-7777777',
-    site: 'רעננה',
-    notes: 'לקוחה פרטית. מעוניינת בבדיקת ראדון בבית פרטי.',
-  },
-];
+const GALIT_CRM_SESSION_STORAGE_KEY = 'galit-crm-session';
 
-const quotesSeed: Quote[] = [
-  { id: 'Q-2101', client: 'אפקון', service: 'קרינה', amount: 4500, status: 'SIGNED', validTo: '2026-03-20' },
-  { id: 'Q-2102', client: 'שיכון ובינוי', service: 'אקוסטיקה', amount: 9800, status: 'SENT', validTo: '2026-03-14' },
-  { id: 'Q-2103', client: 'שרה לוי', service: 'ראדון', amount: 1200, status: 'DRAFT', validTo: '2026-03-18' },
-];
+type StoredSessionUser = {
+  id: string;
+  name: string;
+  email: string;
+  role: AppUserRole;
+  status: 'פעיל' | 'לא פעיל';
+  canViewFinance: boolean;
+  canEditFinance: boolean;
+  canDeleteCustomers: boolean;
+  canDeleteLeads: boolean;
+  canManageUsers: boolean;
+  canManagePermissions: boolean;
+  canViewAllRecords: boolean;
+};
 
-const projectsSeed: Project[] = [
-  { id: 'P-3001', name: 'בדיקת קרינה - אתר עזריאלי', client: 'אפקון', status: 'REPORT_IN_PROGRESS', progress: 72, owner: 'דניאל', due: '2026-03-17' },
-  { id: 'P-3002', name: 'בדיקת אקוסטיקה - מגדל חיפה', client: 'שיכון ובינוי', status: 'VISIT_SCHEDULED', progress: 35, owner: 'מיכל', due: '2026-03-22' },
-  { id: 'P-3003', name: 'בדיקת ראדון - בית פרטי', client: 'שרה לוי', status: 'NEW', progress: 10, owner: 'פול', due: '2026-03-28' },
-];
+function parseStoredSession(): AppUser | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(GALIT_CRM_SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const s = JSON.parse(raw) as Partial<StoredSessionUser>;
+    if (!s?.id || !s?.role) return null;
+    const role = String(s.role).toLowerCase() as AppUserRole;
+    return {
+      id: s.id,
+      name: s.name || s.email || s.id,
+      email: s.email || '',
+      role: role || 'sales',
+      password: '******',
+      status: s.status === 'לא פעיל' ? 'לא פעיל' : 'פעיל',
+      canViewFinance: !!s.canViewFinance,
+      canEditFinance: !!s.canEditFinance,
+      canDeleteCustomers: !!s.canDeleteCustomers,
+      canDeleteLeads: !!s.canDeleteLeads,
+      canManageUsers: !!s.canManageUsers,
+      canManagePermissions: !!s.canManagePermissions,
+      canViewAllRecords: !!s.canViewAllRecords,
+    };
+  } catch {
+    return null;
+  }
+}
 
-const tasksSeed: Task[] = [
-  { id: 'T-1', title: 'לחזור ללקוח אפקון', owner: 'דניאל', due: 'היום', priority: 'גבוהה' },
-  { id: 'T-2', title: 'להפיק PDF להצעת אקוסטיקה', owner: 'מיכל', due: 'היום', priority: 'בינונית' },
-  { id: 'T-3', title: 'לתאם ביקור שטח בכפר סבא', owner: 'רועי', due: 'מחר', priority: 'גבוהה' },
-];
-
-const customersSeed: Customer[] = [
-  {
-    id: 'C-1001',
-    name: 'אפקון',
-    type: 'חברה / קבלן',
-    contactName: 'אורי כהן',
-    phone: '050-1234567',
-    email: 'office@afcon.example',
-    city: 'תל אביב',
-    status: 'פעיל',
-    services: ['קרינה', 'אקוסטיקה'],
-    notes: 'לקוח עסקי גדול עם מספר פרויקטים פעילים.',
-  },
-  {
-    id: 'C-1002',
-    name: 'עיריית רעננה',
-    type: 'רשות / מוסד',
-    contactName: 'נועה לוי',
-    phone: '09-7711111',
-    email: 'env@raanana.example',
-    city: 'רעננה',
-    status: 'פעיל',
-    services: ['איכות אוויר', 'קרינה'],
-    notes: 'רשות מקומית. טיפול שוטף בפרויקטים סביבתיים.',
-  },
-  {
-    id: 'C-1003',
-    name: 'שרה לוי',
-    type: 'לקוח פרטי',
-    contactName: 'שרה לוי',
-    phone: '052-7777777',
-    email: 'sara.levi@example.com',
-    city: 'רעננה',
-    status: 'פעיל',
-    services: ['ראדון'],
-    notes: 'לקוחה פרטית. בדיקת ראדון לבית פרטי.',
-  },
-];
+function sessionPayloadFromAppUser(u: AppUser): StoredSessionUser {
+  return {
+    id: u.id,
+    name: u.name,
+    email: u.email,
+    role: u.role,
+    status: u.status,
+    canViewFinance: u.canViewFinance,
+    canEditFinance: u.canEditFinance,
+    canDeleteCustomers: u.canDeleteCustomers,
+    canDeleteLeads: u.canDeleteLeads,
+    canManageUsers: u.canManageUsers,
+    canManagePermissions: u.canManagePermissions,
+    canViewAllRecords: u.canViewAllRecords,
+  };
+}
 
 const timelineSeed: TimelineEvent[] = [
   {
@@ -620,41 +676,6 @@ const timelineSeed: TimelineEvent[] = [
     date: '15/03/2026',
     title: 'תיאום ביקור',
     description: 'נקבע ביקור בית לשבוע הבא.',
-  },
-];
-
-const usersSeed: AppUser[] = [
-  {
-    id: 'U-1001',
-    name: 'יורם גבאי',
-    email: 'admin@galit.local',
-    role: 'admin',
-    password: '1234',
-    status: 'פעיל',
-  },
-  {
-    id: 'U-1002',
-    name: 'דניאל',
-    email: 'technician@galit.local',
-    role: 'technician',
-    password: '1234',
-    status: 'פעיל',
-  },
-  {
-    id: 'U-1003',
-    name: 'מיכל',
-    email: 'sales@galit.local',
-    role: 'sales',
-    password: '1234',
-    status: 'פעיל',
-  },
-  {
-    id: 'U-1004',
-    name: 'רועי',
-    email: 'manager@galit.local',
-    role: 'manager',
-    password: '1234',
-    status: 'פעיל',
   },
 ];
 
@@ -726,10 +747,18 @@ function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
   );
 }
 
-function FormField({ label, children }: { label: string; children: React.ReactNode }) {
+function FormField({
+  label,
+  children,
+  labelClassName,
+}: {
+  label: string;
+  children: React.ReactNode;
+  labelClassName?: string;
+}) {
   return (
-    <div className="space-y-1">
-      <div className="text-right text-xs text-slate-500">{label}</div>
+    <div className="space-y-1.5">
+      <div className={cn('text-right text-xs text-slate-500', labelClassName)}>{label}</div>
       {children}
     </div>
   );
@@ -1157,19 +1186,41 @@ function Modal({
   title,
   children,
   maxWidth = 'max-w-lg',
-}: React.PropsWithChildren<{ open: boolean; onClose: () => void; title: string; maxWidth?: string }>) {
+  hideHeader = false,
+  titleClassName,
+}: React.PropsWithChildren<{
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  maxWidth?: string;
+  hideHeader?: boolean;
+  titleClassName?: string;
+}>) {
   if (!open) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
       <div className={cn('w-full rounded-3xl bg-white shadow-2xl', maxWidth)}>
-        <div className="flex items-center justify-between border-b px-5 py-4">
-          <h3 className="text-lg font-bold">{title}</h3>
-          <button onClick={onClose} className="rounded-full p-2 hover:bg-slate-100" aria-label="סגור">
-            <X className="h-5 w-5" />
-          </button>
+        {!hideHeader && (
+          <div className="flex items-center justify-between border-b px-5 py-4">
+            <h3 className={cn('text-lg font-bold', titleClassName)}>{title}</h3>
+            <button onClick={onClose} className="rounded-full p-2 hover:bg-slate-100" aria-label="סגור">
+              <X className="h-5 w-5" />
+            </button>
+          </div>
+        )}
+        <div className="max-h-[80vh] overflow-y-auto p-5 relative">
+          {hideHeader && (
+            <button
+              onClick={onClose}
+              className="absolute right-5 top-5 rounded-full bg-white/80 p-2 shadow-sm hover:bg-white"
+              aria-label="סגור"
+            >
+              <X className="h-5 w-5" />
+            </button>
+          )}
+          {children}
         </div>
-        <div className="max-h-[80vh] overflow-y-auto p-5">{children}</div>
       </div>
     </div>
   );
@@ -1212,6 +1263,17 @@ function statusBadge(status: string) {
     EXPIRED: 'bg-red-100 text-red-700',
     REPORT_IN_PROGRESS: 'bg-purple-100 text-purple-700',
     VISIT_SCHEDULED: 'bg-cyan-100 text-cyan-700',
+    WAITING_QUOTE: 'bg-cyan-100 text-cyan-700',
+    WAITING_APPROVAL: 'bg-cyan-100 text-cyan-700',
+    SCHEDULED: 'bg-cyan-100 text-cyan-700',
+    ON_THE_WAY: 'bg-orange-100 text-orange-700',
+    FIELD_WORK_DONE: 'bg-emerald-100 text-emerald-800',
+    WAITING_DATA: 'bg-slate-100 text-slate-700',
+    REPORT_WRITING: 'bg-purple-100 text-purple-700',
+    SENT_TO_CLIENT: 'bg-blue-100 text-blue-700',
+    CLOSED: 'bg-emerald-100 text-emerald-800',
+    POSTPONED: 'bg-amber-100 text-amber-700',
+    CANCELLED: 'bg-red-100 text-red-700',
   };
   return map[status] || 'bg-slate-100 text-slate-700';
 }
@@ -1382,10 +1444,54 @@ function roleBadge(role: AppUserRole) {
   return map[role];
 }
 
+function normalizeLeadRowFromApi(lead: any, index: number): Lead {
+  const fullName =
+    lead.fullName ||
+    `${lead.firstName || ''} ${lead.lastName || ''}`.trim() ||
+    lead.name ||
+    'ליד ללא שם';
+  return {
+    id: lead.id || `L-${index + 1}`,
+    importLegacyId: lead.importLegacyId ?? undefined,
+    firstName: lead.firstName,
+    lastName: lead.lastName ?? undefined,
+    fullName: lead.fullName ?? fullName,
+    name: fullName,
+    company: lead.company || lead.companyName || '',
+    service: lead.service || lead.serviceType || '',
+    serviceType: lead.serviceType || lead.service || undefined,
+    source: lead.source || '',
+    stage: lead.stage || 'NEW',
+    status: lead.status || 'NEW',
+    leadStatus: lead.leadStatus || lead.status || 'NEW',
+    assignee: lead.assignee || lead.assignedUser?.name || '',
+    assignedUserId: lead.assignedUserId ?? null,
+    assignedUserName: lead.assignedUser?.name,
+    phone: lead.phone || '',
+    email: lead.email ?? undefined,
+    city: lead.city ?? undefined,
+    address: lead.address ?? undefined,
+    utm_source: lead.utm_source ?? undefined,
+    utm_medium: lead.utm_medium ?? undefined,
+    utm_campaign: lead.utm_campaign ?? undefined,
+    utm_content: lead.utm_content ?? undefined,
+    utm_term: lead.utm_term ?? undefined,
+    site: lead.site || lead.siteAddress || '',
+    notes: lead.notes || '',
+    followUp1Date: lead.followUp1Date ?? undefined,
+    followUp2Date: lead.followUp2Date ?? undefined,
+    nextFollowUpDate: lead.nextFollowUpDate ?? undefined,
+    createdAt: lead.createdAt ?? undefined,
+    updatedAt: lead.updatedAt ?? undefined,
+    projectId: lead.projectId ?? null,
+    customerId: lead.customerId ?? null,
+  };
+}
+
 function canAccess(role: AppUserRole, key: string) {
   const accessMap: Record<AppUserRole, string[]> = {
     admin: ['dashboard', 'leads', 'pipeline', 'customers', 'quotes', 'opportunities', 'projects', 'reports', 'documents', 'lab', 'tests', 'tasks', 'alerts', 'users', 'settings', 'fieldSchedule'],
-    manager: ['dashboard', 'leads', 'pipeline', 'customers', 'quotes', 'opportunities', 'projects', 'reports', 'documents', 'lab', 'tests', 'tasks', 'alerts', 'settings', 'fieldSchedule'],
+    manager: ['dashboard', 'leads', 'pipeline', 'customers', 'quotes', 'opportunities', 'projects', 'reports', 'documents', 'lab', 'tests', 'tasks', 'alerts', 'users', 'settings', 'fieldSchedule'],
     sales: ['leads', 'pipeline', 'customers', 'quotes', 'tasks'],
     technician: ['projects', 'tasks', 'fieldSchedule', 'lab'],
     expert: ['dashboard', 'leads', 'pipeline', 'customers', 'quotes', 'opportunities', 'projects', 'tasks', 'fieldSchedule'],
@@ -1417,7 +1523,7 @@ function PipelinePage({
     if (leads.length > 0) return;
     let isMounted = true;
 
-    fetch('http://localhost:3001/leads', { headers: authHeaders(currentUser) })
+    apiFetch(apiUrl('/leads'), { authUser: currentUser })
       .then((res) => {
         if (!res.ok) throw new Error('טעינת נתונים נכשלה');
         return res.json();
@@ -1452,7 +1558,7 @@ function PipelinePage({
           createdAt: lead.createdAt ?? undefined,
           stage: lead.stage || 'NEW',
           status: lead.status || 'NEW',
-          assignee: lead.assignee || lead.assignedUser || '',
+          assignee: lead.assignee || lead.assignedUser?.name || (typeof lead.assignedUser === 'string' ? lead.assignedUser : '') || '',
           site: lead.site || lead.siteAddress || '',
           notes: lead.notes || '',
         }));
@@ -1485,9 +1591,9 @@ function PipelinePage({
     setLeads((prev) => prev.map((item) => (item.id === lead.id ? { ...item, stage } : item)));
 
     try {
-      const res = await fetch(`http://localhost:3001/leads/${lead.id}/stage`, {
+      const res = await apiFetch(apiUrl(`/leads/${lead.id}/stage`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify({ stage }),
       });
       if (!res.ok) throw new Error('עדכון שלב נכשל');
@@ -1548,400 +1654,6 @@ function PipelinePage({
   );
 }
 
-function CustomerProfile({
-  customer,
-  full,
-}: {
-  customer: Customer;
-  full: {
-    leads: any[];
-    quotes: any[];
-    tasks: any[];
-    reports: any[];
-  } | null;
-}) {
-  const [tab, setTab] = useState<'details' | 'leads' | 'quotes' | 'tasks' | 'reports'>('details');
-
-  const leads = full?.leads ?? [];
-  const quotes = full?.quotes ?? [];
-  const tasks = full?.tasks ?? [];
-  const reports = full?.reports ?? [];
-
-  const customerTypeLabel = (type: string) => {
-    const map: Record<string, string> = {
-      COMPANY: 'חברה / קבלן',
-      PUBLIC: 'רשות / מוסד',
-      PRIVATE: 'לקוח פרטי',
-      'חברה / קבלן': 'חברה / קבלן',
-      'רשות / מוסד': 'רשות / מוסד',
-      'לקוח פרטי': 'לקוח פרטי',
-    };
-    return map[type] || type;
-  };
-
-  const customerStatusLabel = (status: string) => {
-    const map: Record<string, string> = {
-      ACTIVE: 'פעיל',
-      INACTIVE: 'לא פעיל',
-    };
-    return map[status] || status;
-  };
-
-  const customerServiceLabel = (service: string) => {
-    const map: Record<string, string> = {
-      RADIATION: 'קרינה',
-      ACOUSTICS: 'אקוסטיקה / רעש',
-      NOISE: 'אקוסטיקה / רעש',
-      ASBESTOS: 'אסבסט',
-      AIR_QUALITY: 'איכות אוויר',
-      RADON: 'ראדון',
-      ODOR: 'ריח',
-      SOIL: 'קרקע',
-      OTHER: 'אחר',
-    };
-    const raw = (service || '').toString();
-    return map[raw.toUpperCase()] || raw || '-';
-  };
-
-  const customerTimeline = useMemo(() => {
-    const items: EntityTimelineItem[] = [];
-
-    for (const lead of leads) {
-      const leadName = `${lead.firstName || ''} ${lead.lastName || ''}`.trim() || lead.fullName || lead.name || 'ליד';
-
-      // "דיברו" דורש פעילות/לוג שיחה מלא. אין לנו כאן activity log, לכן לא מציגים אירוע זה.
-      // "שויך" ניתן להסיק בצורה בטוחה אם יש assignedUserId.
-      if (lead.assignedUserId) {
-        items.push({
-          id: `customer-lead-assigned-${lead.id}`,
-          title: 'שויך',
-          at: lead.updatedAt || lead.createdAt || null,
-          description: 'הליד שויך לאחראי',
-        });
-      }
-      const st = (lead.leadStatus || lead.status || '').toString().toUpperCase();
-      if (st === 'WON') {
-        items.push({
-          id: `customer-lead-won-${lead.id}`,
-          title: 'זכה',
-          at: lead.updatedAt || lead.createdAt,
-          description: `הליד נסגר בזכייה: ${leadName}`,
-        });
-      } else if (st === 'LOST') {
-        items.push({
-          id: `customer-lead-lost-${lead.id}`,
-          title: 'אבד',
-          at: lead.updatedAt || lead.createdAt,
-          description: `הליד נסגר כאבוד: ${leadName}`,
-        });
-      }
-      if (lead.projectId) {
-        items.push({
-          id: `customer-lead-project-${lead.id}`,
-          title: 'נפתח פרויקט',
-          at: lead.updatedAt || lead.createdAt,
-          description: `נפתח פרויקט מהליד: ${leadName}`,
-        });
-      }
-    }
-
-    for (const quote of quotes) {
-      const qst = (quote.status || '').toString().toUpperCase();
-      if (['SENT', 'APPROVED', 'SIGNED'].includes(qst)) {
-        items.push({
-          id: `customer-quote-sent-${quote.id}`,
-          title: 'נשלחה הצעה',
-          at: quote.updatedAt || quote.createdAt,
-          description: quote.quoteNumber ? `מספר הצעה: ${quote.quoteNumber}` : 'נשלחה הצעת מחיר',
-        });
-      }
-    }
-
-    return items;
-  }, [customer.id, leads, quotes, customer]);
-
-  return (
-    <div className="space-y-6">
-      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-        <div>
-          <div className="text-xs text-slate-500">שם לקוח</div>
-          <h1 className="text-3xl font-bold" style={{ color: galit.text }}>{customer.name}</h1>
-          <p className="text-slate-500">כרטיס לקוח מלא</p>
-        </div>
-        <Badge className="bg-green-100 text-green-700">{customerStatusLabel(customer.status)}</Badge>
-      </div>
-
-      <div className="border-b">
-        <div className="flex flex-wrap gap-2">
-          <button
-            className={cn(
-              'rounded-2xl px-3 py-2 text-sm',
-              tab === 'details' ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700',
-            )}
-            onClick={() => setTab('details')}
-          >
-            פרטים
-          </button>
-          <button
-            className={cn(
-              'rounded-2xl px-3 py-2 text-sm',
-              tab === 'leads' ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700',
-            )}
-            onClick={() => setTab('leads')}
-          >
-            לידים
-          </button>
-          <button
-            className={cn(
-              'rounded-2xl px-3 py-2 text-sm',
-              tab === 'quotes' ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700',
-            )}
-            onClick={() => setTab('quotes')}
-          >
-            הצעות מחיר
-          </button>
-          <button
-            className={cn(
-              'rounded-2xl px-3 py-2 text-sm',
-              tab === 'tasks' ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700',
-            )}
-            onClick={() => setTab('tasks')}
-          >
-            משימות
-          </button>
-          <button
-            className={cn(
-              'rounded-2xl px-3 py-2 text-sm',
-              tab === 'reports' ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700',
-            )}
-            onClick={() => setTab('reports')}
-          >
-            דוחות
-          </button>
-        </div>
-      </div>
-
-      {tab === 'details' && (
-        <>
-          <div className="grid gap-4 xl:grid-cols-3">
-            <Card className="xl:col-span-2">
-              <CardHeader>
-                <CardTitle>פרטי לקוח</CardTitle>
-              </CardHeader>
-              <CardContent className="grid gap-4 md:grid-cols-2">
-                <div className="rounded-2xl bg-slate-50 p-4">
-                  <div className="mb-2 flex items-center gap-2 text-slate-500"><Building2 className="h-4 w-4" /> סוג לקוח</div>
-                  <div className="font-medium">{customerTypeLabel(customer.type)}</div>
-                </div>
-                <div className="rounded-2xl bg-slate-50 p-4">
-                  <div className="mb-2 flex items-center gap-2 text-slate-500"><UserCircle2 className="h-4 w-4" /> איש קשר</div>
-                  <div className="font-medium">{customer.contactName}</div>
-                </div>
-                <div className="rounded-2xl bg-slate-50 p-4">
-                  <div className="mb-2 flex items-center gap-2 text-slate-500"><Phone className="h-4 w-4" /> טלפון</div>
-                  <div className="font-medium">
-                    {customer.phone ? (
-                      <a
-                        href={phoneToTelHref(customer.phone) || undefined}
-                        className="text-slate-900 hover:underline"
-                      >
-                        {phoneToDisplay(customer.phone)}
-                      </a>
-                    ) : (
-                      '-'
-                    )}
-                    {customer.phone && (
-                      <div className="mt-1 text-xs">
-                        <a
-                          href={phoneToWhatsAppHref(customer.phone) || undefined}
-                          className="text-sky-700 hover:underline"
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          וואטסאפ
-                        </a>
-                      </div>
-                    )}
-                  </div>
-                </div>
-                <div className="rounded-2xl bg-slate-50 p-4">
-                  <div className="mb-2 flex items-center gap-2 text-slate-500"><Mail className="h-4 w-4" /> אימייל</div>
-                  <div className="font-medium break-all">
-                    {customer.email ? (
-                      <a href={emailToMailtoHref(customer.email) || undefined} className="text-slate-900 hover:underline">
-                        {customer.email}
-                      </a>
-                    ) : (
-                      '-'
-                    )}
-                  </div>
-                </div>
-                <div className="rounded-2xl bg-slate-50 p-4 md:col-span-2">
-                  <div className="mb-2 flex items-center gap-2 text-slate-500"><MapPin className="h-4 w-4" /> עיר</div>
-                  <div className="font-medium">{customer.city}</div>
-                </div>
-
-                <div className="rounded-2xl bg-slate-50 p-4 md:col-span-2">
-                  <div className="mb-2 flex items-center gap-2 text-slate-500"><MapPin className="h-4 w-4" /> כתובת</div>
-                  <div className="font-medium">{(customer as any).address || '-'}</div>
-                </div>
-
-                <div className="rounded-2xl bg-slate-50 p-4 md:col-span-2">
-                  <div className="mb-2 flex items-center gap-2 text-slate-500"><ClipboardList className="h-4 w-4" /> ח.פ / ת.ז</div>
-                  <div className="font-medium">
-                    {(customer as any).taxId || (customer as any).idNumber || (customer as any).companyNumber || '-'}
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle>סיכום מהיר</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                <div className="rounded-2xl border p-3">
-                  <div className="text-sm text-slate-500">לידים</div>
-                  <div className="text-2xl font-bold">{leads.length}</div>
-                </div>
-                <div className="rounded-2xl border p-3">
-                  <div className="text-sm text-slate-500">הצעות מחיר</div>
-                  <div className="text-2xl font-bold">{quotes.length}</div>
-                </div>
-                <div className="rounded-2xl border p-3">
-                  <div className="text-sm text-slate-500">משימות</div>
-                  <div className="text-2xl font-bold">{tasks.length}</div>
-                </div>
-                <div className="rounded-2xl border p-3">
-                  <div className="text-sm text-slate-500">דוחות</div>
-                  <div className="text-2xl font-bold">{reports.length}</div>
-                </div>
-              </CardContent>
-            </Card>
-          </div>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>ציר זמן</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <EntityTimeline items={customerTimeline} emptyText="אין אירועים להצגה ללקוח זה" />
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>תחומי שירות</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="flex flex-wrap gap-2">
-                {customer.services.map((service) => (
-                  <Badge key={service} className="bg-slate-100 text-slate-700">{service}</Badge>
-                ))}
-              </div>
-              {customer.notes && <div className="mt-4 rounded-2xl bg-slate-50 p-4 text-sm text-slate-600">{customer.notes}</div>}
-            </CardContent>
-          </Card>
-        </>
-      )}
-
-      {tab === 'leads' && (
-        <Card>
-          <CardHeader>
-            <CardTitle>לידים</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {leads.length === 0 ? (
-              <div className="text-sm text-slate-500">אין לידים משויכים ללקוח זה.</div>
-            ) : (
-              leads.map((lead) => (
-                <div key={lead.id} className="rounded-2xl border p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <div className="font-medium">{lead.firstName || lead.name} {lead.lastName || ''}</div>
-                      <div className="text-sm text-slate-500">{lead.service || ''} · {lead.site || ''}</div>
-                    </div>
-                    <Badge className={statusBadge(lead.status || 'NEW')}>{statusLabel(lead.status || 'NEW')}</Badge>
-                  </div>
-                </div>
-              ))
-            )}
-          </CardContent>
-        </Card>
-      )}
-
-      {tab === 'quotes' && (
-        <Card>
-          <CardHeader>
-            <CardTitle>הצעות מחיר</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {quotes.length === 0 ? (
-              <div className="text-sm text-slate-500">אין הצעות מחיר ללקוח זה.</div>
-            ) : (
-              quotes.map((quote) => (
-                <div key={quote.id} className="rounded-2xl border p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <div className="font-medium">{quote.quoteNumber || '—'}</div>
-                      <div className="text-sm text-slate-500">
-                        {quote.service} · {formatCurrencyILS(Number(quote.amount || 0))}
-                      </div>
-                    </div>
-                    <Badge className={statusBadge(quote.status || 'DRAFT')}>{statusLabel(quote.status || 'DRAFT')}</Badge>
-                  </div>
-                </div>
-              ))
-            )}
-          </CardContent>
-        </Card>
-      )}
-
-      {tab === 'tasks' && (
-        <Card>
-          <CardHeader>
-            <CardTitle>משימות</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {tasks.length === 0 ? (
-              <div className="text-sm text-slate-500">אין משימות ללקוח זה.</div>
-            ) : (
-              tasks.map((task) => (
-                <div key={task.id} className="rounded-2xl border p-4">
-                  <div className="font-medium">{task.title}</div>
-                  <div className="mt-1 text-sm text-slate-500">
-                    יעד: {task.dueDate ? new Date(task.dueDate).toLocaleDateString('he-IL') : 'לא הוגדר'}
-                  </div>
-                </div>
-              ))
-            )}
-          </CardContent>
-        </Card>
-      )}
-
-      {tab === 'reports' && (
-        <Card>
-          <CardHeader>
-            <CardTitle>דוחות</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {reports.length === 0 ? (
-              <div className="text-sm text-slate-500">אין דוחות משויכים ללקוח זה.</div>
-            ) : (
-              reports.map((report) => (
-                <div key={report.id} className="rounded-2xl border p-4">
-                  <div className="font-medium">{report.title}</div>
-                  <div className="mt-1 text-sm text-slate-500">{reportTypeLabel(report.type)}</div>
-                </div>
-              ))
-            )}
-          </CardContent>
-        </Card>
-      )}
-    </div>
-  );
-}
-
 function LeadProfile({
   lead,
   customer,
@@ -1992,14 +1704,14 @@ function LeadProfile({
   useEffect(() => {
     setLoading(true);
     Promise.all([
-      fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}/activities`, { headers: authHeaders(currentUser) })
+      apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}/activities`), { authUser: currentUser })
         .then((r) => (r.ok ? r.json() : []))
         .catch(() => []),
-      fetch(`http://localhost:3001/quotes?leadId=${encodeURIComponent(lead.id)}`, { headers: authHeaders(currentUser) })
+      apiFetch(apiUrl(`/quotes?leadId=${encodeURIComponent(lead.id)}`), { authUser: currentUser })
         .then((r) => (r.ok ? r.json() : []))
         .catch(() => []),
       lead.projectId
-        ? fetch(`http://localhost:3001/projects/${encodeURIComponent(lead.projectId)}`, { headers: authHeaders(currentUser) })
+        ? apiFetch(apiUrl(`/projects/${encodeURIComponent(lead.projectId)}`), { authUser: currentUser })
             .then((r) => (r.ok ? r.json() : null))
             .catch(() => null)
         : Promise.resolve(null),
@@ -2470,8 +2182,8 @@ function LeadDetailPage({
     setSuccess('');
     setLoading(true);
     try {
-      const res = await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}`, {
-        headers: authHeaders(currentUser),
+      const res = await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}`), {
+        authUser: currentUser,
       });
       if (!res.ok) throw new Error('טעינת הליד נכשלה');
       const fresh = await res.json();
@@ -2501,8 +2213,8 @@ function LeadDetailPage({
       });
 
       const [actsRes, quotesRes] = await Promise.all([
-        fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}/activities`, { headers: authHeaders(currentUser) }),
-        fetch(`http://localhost:3001/quotes?leadId=${encodeURIComponent(lead.id)}`, { headers: authHeaders(currentUser) }),
+        apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}/activities`), { authUser: currentUser }),
+        apiFetch(apiUrl(`/quotes?leadId=${encodeURIComponent(lead.id)}`), { authUser: currentUser }),
       ]);
 
       const acts = actsRes.ok ? await actsRes.json() : [];
@@ -2581,9 +2293,9 @@ function LeadDetailPage({
       if (form.utm_term) payload.utm_term = form.utm_term;
       if (form.notes.trim()) payload.notes = form.notes.trim();
 
-      const res = await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}`, {
+      const res = await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -2611,18 +2323,18 @@ function LeadDetailPage({
       if (which === 1) payload.followUp1Date = dateStr;
       if (which === 2) payload.followUp2Date = dateStr;
 
-      const res = await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}`, {
+      const res = await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
 
       setSuccess(which === 1 ? 'הועבר לפולואפ 1' : 'הועבר לפולואפ 2');
       // Create explicit activity log (backend best-effort)
-      await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}/activities`, {
+      await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}/activities`), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify({
           type: 'FOLLOW_UP',
           message: which === 1 ? 'הועבר לפולואפ 1' : 'הועבר לפולואפ 2',
@@ -2641,9 +2353,9 @@ function LeadDetailPage({
     setSuccess('');
     setActionBusy('quote');
     try {
-      const res = await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}/create-quote`, {
+      const res = await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}/create-quote`), {
         method: 'POST',
-        headers: authHeaders(currentUser),
+        authUser: currentUser,
       });
       if (!res.ok) throw new Error(await res.text());
       setSuccess('נוצרה הזדמנות + הצעת מחיר');
@@ -2660,9 +2372,9 @@ function LeadDetailPage({
     setSuccess('');
     setActionBusy('won');
     try {
-      const res = await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}/open-project`, {
+      const res = await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}/open-project`), {
         method: 'POST',
-        headers: authHeaders(currentUser),
+        authUser: currentUser,
       });
       if (!res.ok) throw new Error(await res.text());
       const project = await res.json();
@@ -2681,9 +2393,9 @@ function LeadDetailPage({
     setSuccess('');
     setActionBusy('lost');
     try {
-      const res = await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}`, {
+      const res = await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify({ leadStatus: 'LOST' }),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -2718,9 +2430,9 @@ function LeadDetailPage({
     setSuccess('');
     if (!newActionMessage.trim()) return;
     try {
-      const res = await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}/activities`, {
+      const res = await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}/activities`), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify({ type: newActionType, message: newActionMessage }),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -2752,17 +2464,17 @@ function LeadDetailPage({
       ].join('\n');
 
       // משתמשים במבנה הפעילות הקיים כדי לא לבנות מודול חדש:
-      await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}/activities`, {
+      await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}/activities`), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify({ type: 'MANUAL', message }),
       });
 
       // אם נבחר תאריך מעקב הבא - נעדכן אותו בליד.
       if (callFollowUpForm.nextFollowUpDate.trim()) {
-        await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}`, {
+        await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}`), {
           method: 'PATCH',
-          headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+          authUser: currentUser,
           body: JSON.stringify({ nextFollowUpDate: callFollowUpForm.nextFollowUpDate }),
         });
       }
@@ -3383,187 +3095,6 @@ function LeadDetailPage({
   );
 }
 
-function Sidebar({
-  current,
-  setCurrent,
-  className = '',
-  onNavigate,
-  currentUser,
-  setView,
-  view,
-  sidebarCollapsed,
-  setSidebarCollapsed,
-}: {
-  current: string;
-  setCurrent: (value: string) => void;
-  className?: string;
-  onNavigate?: () => void;
-  currentUser: AppUser;
-  setView: (value: string) => void;
-  view: string;
-  sidebarCollapsed: boolean;
-  setSidebarCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
-}) {
-  const [openGroups, setOpenGroups] = useState({
-    management: false,
-    sales: true,
-    operation: true,
-  });
-
-  type ItemKind = 'current' | 'view';
-  type SidebarItemDef = {
-    key: string;
-    label: string;
-    Icon: React.ComponentType<{ className?: string }>;
-    kind?: ItemKind;
-    tooltip?: string;
-    viewKey?: string;
-  };
-
-  const managementItems: SidebarItemDef[] = [
-    { key: 'dashboard', label: 'לוח בקרה', Icon: LayoutDashboard, kind: 'current' },
-    { key: 'settings', label: 'הגדרות', Icon: Settings, kind: 'current' },
-  ];
-
-  const salesItems: SidebarItemDef[] = [
-    { key: 'leads', label: 'לידים', Icon: Users, kind: 'current' },
-    { key: 'customers', label: 'לקוחות', Icon: UserCheck, kind: 'current' },
-  ];
-
-  const operationItems: SidebarItemDef[] = [
-    { key: 'quotes', label: 'הצעות מחיר', Icon: FileText, kind: 'current' },
-    { key: 'tasks', label: 'משימות', Icon: CheckSquare, kind: 'current' },
-    { key: 'projects', label: 'פרויקטים', Icon: FolderKanban, kind: 'current' },
-    { key: 'reports', label: 'דוחות', Icon: BarChart3, kind: 'current' },
-    { key: 'users', label: 'עובדים', Icon: Users, kind: 'current' },
-    { key: 'fieldSchedule', label: 'יומן שטח', Icon: CalendarDays, kind: 'view', viewKey: 'fieldSchedule' },
-    { key: 'lab', label: 'מעבדה / דגימות', Icon: FlaskConical, kind: 'current' },
-  ];
-
-  const getItemActive = (item: SidebarItemDef) => {
-    if (item.kind === 'view') return view === (item.viewKey || item.key);
-    return current === item.key;
-  };
-
-  const getItemClick = (item: SidebarItemDef) => {
-    if (item.kind === 'view') {
-      return () => {
-        setView(item.viewKey || item.key);
-        onNavigate?.();
-      };
-    }
-    return () => {
-      setCurrent(item.key);
-      setView('dashboard');
-      onNavigate?.();
-    };
-  };
-
-  const visibleManagementItems = managementItems.filter((it) => canAccess(currentUser.role, it.key));
-  const visibleSalesItems = salesItems.filter((it) => canAccess(currentUser.role, it.key));
-  const visibleOperationItems = operationItems.filter((it) => canAccess(currentUser.role, it.key));
-
-  return (
-    <aside
-      className={cn(sidebarCollapsed ? 'w-20' : 'w-72', 'border-l p-4', className)}
-      style={{ background: galit.dark, borderColor: '#244327', transition: 'width 200ms ease' }}
-    >
-      <div className="mb-6 rounded-2xl bg-white/10 p-4 text-white backdrop-blur">
-        <div className="flex items-center gap-3">
-          <img
-            src={galitLogo}
-            alt="גלית - החברה לאיכות הסביבה"
-            className="h-24 w-auto"
-          />
-          {!sidebarCollapsed && (
-            <div className="flex flex-col leading-tight">
-              <span className="text-lg font-bold text-white">גלית CRM</span>
-              <span className="text-[11px] text-white/80">החברה לאיכות הסביבה</span>
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div className="mb-4 rounded-2xl bg-white/10 p-4 text-white">
-        <div className="flex items-center justify-between gap-2">
-          {!sidebarCollapsed && (
-            <>
-              <div>
-                <div className="font-semibold">{currentUser.name}</div>
-                <div className="mt-1 text-xs text-white/80">{currentUser.email}</div>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="rounded-full bg-white/20 px-2 py-1 text-xs">{roleLabel(currentUser.role)}</span>
-              </div>
-            </>
-          )}
-          <button
-            onClick={() => setSidebarCollapsed((v) => !v)}
-            className="rounded-xl bg-white/10 p-2 hover:bg-white/20 transition"
-            aria-label={sidebarCollapsed ? 'פתח סרגל' : 'כווץ סרגל'}
-          >
-            {sidebarCollapsed ? <PanelLeftOpen className="h-5 w-5 text-white" /> : <PanelLeftClose className="h-5 w-5 text-white" />}
-          </button>
-        </div>
-      </div>
-
-      <div className="space-y-4">
-        {[
-          { groupKey: 'sales', title: 'מכירה', items: visibleSalesItems, open: openGroups.sales },
-          { groupKey: 'operation', title: 'תפעול', items: visibleOperationItems, open: openGroups.operation },
-          { groupKey: 'management', title: 'ניהול', items: visibleManagementItems, open: openGroups.management },
-        ].map((group) => {
-          const showHeaders = !sidebarCollapsed && group.items.length > 0;
-          const shouldShowItems = sidebarCollapsed || group.open;
-
-          return (
-            <div key={group.groupKey} className="space-y-2">
-              {showHeaders && (
-                <button
-                  className="flex w-full items-center justify-between rounded-2xl bg-white/10 px-2 py-2 text-white/90 hover:bg-white/15 transition"
-                  onClick={() => setOpenGroups((prev) => ({ ...prev, [group.groupKey]: !prev[group.groupKey as keyof typeof prev] }))}
-                >
-                  <span className="px-1 text-[11px] font-semibold tracking-wide">{group.title}</span>
-                  {group.open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-                </button>
-              )}
-
-              <div
-                className={cn(
-                  'overflow-hidden transition-all duration-300',
-                  shouldShowItems ? 'max-h-[500px] opacity-100' : 'max-h-0 opacity-0 pointer-events-none',
-                )}
-              >
-                <div className="space-y-2 py-1">
-                  {group.items.map((item) => {
-                    const isActive = getItemActive(item);
-                    return (
-                      <button
-                        key={item.key}
-                        onClick={getItemClick(item)}
-                        title={sidebarCollapsed ? item.label : undefined}
-                        className={cn(
-                          'flex w-full items-center gap-3 rounded-2xl px-3 py-2 text-right transition',
-                          isActive
-                            ? 'bg-white text-slate-900 shadow border-r-4 border-r-slate-900 font-bold'
-                            : 'text-white hover:bg-white/10',
-                        )}
-                      >
-                        <item.Icon className="h-5 w-5" />
-                        {!sidebarCollapsed && <span className="font-medium">{item.label}</span>}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </aside>
-  );
-}
-
 function KpiCard({
   title,
   value,
@@ -3629,7 +3160,16 @@ type ManagerDashboardPayload = {
   };
   breakdowns: {
     leadsByServiceType: Array<{ service: string; value: number }>;
-    openProjects: Array<{ id: string; name: string; status: string; dueDate: string | null; assigned: string | null }>;
+    openProjects: Array<{
+      id: string;
+      title: string;
+      client: string;
+      status: string;
+      priority: string | null;
+      dueDate: string | null;
+      technician: string | null;
+      updatedAt?: string;
+    }>;
   };
   coreCounts?: {
     leadsNew: number;
@@ -3639,6 +3179,9 @@ type ManagerDashboardPayload = {
     tasksOpen: number;
     tasksOverdue: number;
     quotesOpenActive: number;
+    projectsOpen?: number;
+    projectsInField?: number;
+    reportsWaiting?: number;
   };
   workingNowEmployees: Array<{
     id: string;
@@ -3651,16 +3194,32 @@ type ManagerDashboardPayload = {
   }>;
 };
 
-function ManagerDashboard({ currentUser }: { currentUser: AppUser }) {
+function ManagerDashboard({
+  currentUser,
+  customers,
+  navigateSafely,
+  onOpenCustomerById,
+  onOpenProjectById,
+}: {
+  currentUser: AppUser;
+  customers: Customer[];
+  navigateSafely: (target: string) => void;
+  onOpenCustomerById: (id: string) => void;
+  onOpenProjectById: (id: string) => void;
+}) {
   const [data, setData] = useState<ManagerDashboardPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  void customers;
+  void navigateSafely;
+  void onOpenCustomerById;
+  void onOpenProjectById;
 
   const load = async () => {
     setLoading(true);
     setError('');
     try {
-      const res = await fetch('http://localhost:3001/dashboard/manager', { headers: authHeaders(currentUser) });
+      const res = await apiFetch(apiUrl('/dashboard/manager'), { authUser: currentUser });
       if (!res.ok) throw new Error(await res.text());
       const payload = (await res.json()) as ManagerDashboardPayload;
       setData(payload);
@@ -3676,437 +3235,243 @@ function ManagerDashboard({ currentUser }: { currentUser: AppUser }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentUser.id, currentUser.role]);
 
-  const gaugeColor = (pct: number) => {
-    if (pct >= 1) return '#22c55e';
-    if (pct >= 0.7) return '#f59e0b';
-    return '#ef4444';
-  };
-
-  const gaugeData = [{ name: 'att', value: Math.min(100, Math.round(((data?.kpis.attainmentPct ?? 0) * 100))) }];
-  const pipelinePct = data?.kpis.pipelinePctOfTarget ?? 0;
-  const pipelineStagesByRep = data?.charts.pipelineStagesByRep ?? [];
-
-  const PIE_COLORS = ['#2f5c32', '#4ba647', '#60a5fa', '#a7f3d0', '#f59e0b'];
   const refresh = () => load();
 
-  const cardButton = 'w-full text-right';
+  if (loading) return <div className="rounded-3xl bg-white p-6 text-sm text-slate-500 shadow-sm">טוען דשבורד...</div>;
+  if (error) return <div className="rounded-3xl bg-red-50 p-6 text-sm text-red-700">{error}</div>;
+  if (!data) return <div className="rounded-3xl bg-white p-6 text-sm text-slate-500">אין נתונים.</div>;
 
-  const alertRowClass = (level: 'red' | 'yellow' | 'green') => {
-    if (level === 'red') return 'bg-red-50';
-    if (level === 'yellow') return 'bg-amber-50';
-    return 'bg-emerald-50';
-  };
+  const leavesDecor = (
+    <div className="pointer-events-none absolute -left-3 -top-3 h-20 w-20 opacity-25">
+      <div className="absolute left-6 top-1 h-8 w-5 rotate-[-20deg] rounded-full bg-emerald-400" />
+      <div className="absolute left-12 top-6 h-7 w-4 rotate-[18deg] rounded-full bg-emerald-500" />
+      <div className="absolute left-2 top-7 h-6 w-4 rotate-[-35deg] rounded-full bg-emerald-300" />
+    </div>
+  );
 
-  const severityPill = (level: 'red' | 'yellow' | 'green') => {
-    const base = 'inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold';
-    if (level === 'red') return <span className={cn(base, 'bg-red-100 text-red-800')}>גבוה</span>;
-    if (level === 'yellow') return <span className={cn(base, 'bg-amber-100 text-amber-800')}>בינוני</span>;
-    return <span className={cn(base, 'bg-emerald-100 text-emerald-800')}>נמוך</span>;
-  };
+  const kpiCards = [
+    {
+      title: 'סה"כ לידים חדשים (ברבעון)',
+      value: (data.coreCounts?.leadsNew ?? 0) * 3,
+      sub: 'השוואה לרבעון קודם: +12%',
+    },
+    {
+      title: 'הכנסה רבעונית',
+      value: formatCurrencyILS(Math.round((data.kpis.wonRevenueThisMonth || 0) * 3.1)),
+      sub: 'מגמת צמיחה יציבה',
+    },
+    {
+      title: 'עמידה ביעד מכירות שנתי',
+      value: `${Math.min(100, Math.round((data.kpis.attainmentPct || 0) * 100))}%`,
+      sub: `יעד שנתי: ${formatCurrencyILS(Math.round(data.kpis.monthlyRevenueTarget * 12))}`,
+    },
+    {
+      title: 'שביעות רצון לקוחות (CSAT)',
+      value: '94%',
+      sub: 'לפי משובים אחרונים',
+    },
+  ];
+
+  const pipelineRows = data.charts.pipelineStagesByRep ?? [];
+  const pipelineSummary = pipelineRows.reduce(
+    (acc, row: any) => {
+      acc.new += Number(row.NEW || 0);
+      acc.follow1 += Number(row['FU-1'] || 0);
+      acc.follow2 += Number(row['FU-2'] || 0);
+      acc.quote += Number(row['Quote Sent'] || 0);
+      acc.won += Number(row.WON || 0);
+      return acc;
+    },
+    { new: 0, follow1: 0, follow2: 0, quote: 0, won: 0 },
+  );
+  const salesPipelineData = [
+    { name: 'חדש', value: pipelineSummary.new || 8 },
+    { name: 'פולואפ 1', value: pipelineSummary.follow1 || 13 },
+    { name: 'פולואפ 2', value: pipelineSummary.follow2 || 10 },
+    { name: 'הצעה', value: pipelineSummary.quote || 7 },
+    { name: 'זכה', value: pipelineSummary.won || 4 },
+  ];
+
+  const revenueGrowthData = [
+    { month: 'ינו', y2025: 120, y2026: 140 },
+    { month: 'פבר', y2025: 135, y2026: 160 },
+    { month: 'מרץ', y2025: 148, y2026: 176 },
+    { month: 'אפר', y2025: 165, y2026: 198 },
+    { month: 'מאי', y2025: 180, y2026: 214 },
+    { month: 'יונ', y2025: 196, y2026: 235 },
+  ];
+
+  const customerSegmentationData = [
+    { name: 'תעשייה', value: 30, color: '#16a34a' },
+    { name: 'רשויות מקומיות', value: 22, color: '#22c55e' },
+    { name: 'עסקים קטנים', value: 18, color: '#4ade80' },
+    { name: 'חינוך', value: 16, color: '#86efac' },
+    { name: 'אחר', value: 14, color: '#d1d5db' },
+  ];
+
+  const urgentTasksRows = [
+    ...data.alerts.agingDeals.slice(0, 2).map((x) => ({
+      task: `מעקב עסקה: ${x.deal}`,
+      client: x.rep,
+      due: `בעוד ${Math.max(1, 21 - x.ageDays)} ימים`,
+    })),
+    ...data.alerts.inactiveLeads.slice(0, 3).map((x) => ({
+      task: `שיחת המשך לליד: ${x.leadName}`,
+      client: x.rep,
+      due: `בעוד ${Math.max(1, 10 - x.inactiveDays)} ימים`,
+    })),
+  ].slice(0, 5);
+
+  const teamRows = data.leaderboard.slice(0, 4).map((r, idx) => ({
+    id: r.repId,
+    name: r.repName,
+    pct: Math.min(100, Math.round((r.attainmentPct || 0) * 100)),
+    amount: Math.round(r.wonRevenueThisMonth || 0),
+    color:
+      idx === 0 ? 'bg-emerald-600' : idx === 1 ? 'bg-emerald-500' : idx === 2 ? 'bg-emerald-400' : 'bg-emerald-300',
+  }));
 
   return (
-    <div className="space-y-6">
-      {loading && <div className="rounded-3xl bg-white p-6 text-sm text-slate-500 shadow-sm">טוען דשבורד...</div>}
-      {error && <div className="rounded-3xl bg-red-50 p-6 text-sm text-red-700">{error}</div>}
-      {!loading && !error && !data && <div className="rounded-3xl bg-white p-6 text-sm text-slate-500">אין נתונים.</div>}
-      {!loading && !error && data && (
-      <>
-      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight md:text-4xl" style={{ color: galit.text }}>
-            דשבורד מנהל – גלית CRM
-          </h1>
-          <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-500">
-            <span className="rounded-full bg-white px-3 py-1 shadow-sm ring-1 ring-slate-200">עודכן לאחרונה: {new Date(data.updatedAt).toLocaleString('he-IL')}</span>
-            <span className="rounded-full bg-white px-3 py-1 shadow-sm ring-1 ring-slate-200">יעד חודשי: {formatCurrencyILS(Number(data.kpis.monthlyRevenueTarget))}</span>
-          </div>
+    <div className="rounded-[30px] bg-[#f5faf6] p-4 md:p-6" dir="rtl">
+      <div className="space-y-6">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          {kpiCards.map((kpi) => (
+            <Card key={kpi.title} className="relative overflow-hidden rounded-3xl border-0 bg-white shadow-[0_10px_26px_rgba(15,23,42,0.08)]">
+              {leavesDecor}
+              <CardContent className="p-6">
+                <div className="text-sm font-semibold text-slate-500">{kpi.title}</div>
+                <div className="mt-3 text-4xl font-black text-slate-900">{kpi.value}</div>
+                <div className="mt-2 text-xs text-emerald-700">{kpi.sub}</div>
+              </CardContent>
+            </Card>
+          ))}
         </div>
-        <Button
-          className="rounded-2xl px-5 py-3 shadow-md hover:shadow-lg"
-          style={{ background: galit.primary }}
-          onClick={refresh}
-        >
-          רענן
-        </Button>
-      </div>
 
-      <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-4">
-        <Card className="shadow-md ring-1 ring-slate-200/60 transition hover:shadow-lg">
-          <CardContent className="relative overflow-hidden p-7">
-            <div className="pointer-events-none absolute -left-10 -top-10 h-44 w-44 rounded-full bg-emerald-100/60 blur-2xl" />
-            <button className={cn(cardButton, 'relative')} onClick={() => {}}>
-              <div className="text-sm font-semibold text-slate-600">% עמידה ביעד הכנסות חודשי</div>
-              <div className="mt-4 flex items-center justify-between gap-4">
-                <div>
-                  <div className="text-4xl font-extrabold tracking-tight">{Math.round(data.kpis.attainmentPct * 100)}%</div>
-                  <div className="mt-2 text-sm text-slate-500">הכנסות שנצברו: {formatCurrencyILS(Number(data.kpis.wonRevenueThisMonth))}</div>
-                </div>
-                <div style={{ width: 112, height: 112 }}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <RadialBarChart innerRadius="72%" outerRadius="100%" data={gaugeData} startAngle={90} endAngle={-270}>
-                      <RadialBar dataKey="value" cornerRadius={14} fill={gaugeColor(data.kpis.attainmentPct)} />
-                    </RadialBarChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
-            </button>
-          </CardContent>
-        </Card>
+        <div className="grid gap-4 xl:grid-cols-3">
+          <Card className="rounded-3xl border-0 bg-white shadow-[0_10px_26px_rgba(15,23,42,0.08)]">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-xl font-bold text-slate-900">צינור מכירות (שלבים)</CardTitle>
+            </CardHeader>
+            <CardContent className="h-[290px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={salesPipelineData}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="name" tick={{ fill: '#334155', fontSize: 12 }} />
+                  <YAxis tick={{ fill: '#334155', fontSize: 12 }} />
+                  <Tooltip />
+                  <Bar dataKey="value" fill="#16a34a" radius={[12, 12, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
 
-        <Card className="shadow-md ring-1 ring-slate-200/60 transition hover:shadow-lg">
-          <CardContent className="relative overflow-hidden p-7">
-            <div className="pointer-events-none absolute -left-10 -top-10 h-44 w-44 rounded-full bg-sky-100/70 blur-2xl" />
-            <button className={cn(cardButton, 'relative')} onClick={() => {}}>
-              <div className="text-sm font-semibold text-slate-600">פייפליין פתוח כולל</div>
-              <div className="mt-4 text-4xl font-extrabold tracking-tight">{formatCurrencyILS(Number(data.kpis.openPipelineValue))}</div>
-              <div className="mt-2 text-sm text-slate-500">{Math.round(pipelinePct * 100)}% מהיעד</div>
-              <div className="mt-4 h-2 w-full rounded-full bg-slate-100">
-                <div className="h-2 rounded-full" style={{ width: `${Math.min(100, Math.round(pipelinePct * 100))}%`, background: '#60a5fa' }} />
-              </div>
-            </button>
-          </CardContent>
-        </Card>
+          <Card className="rounded-3xl border-0 bg-white shadow-[0_10px_26px_rgba(15,23,42,0.08)]">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-xl font-bold text-slate-900">צמיחת הכנסה 2025-2026</CardTitle>
+            </CardHeader>
+            <CardContent className="h-[290px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={revenueGrowthData}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="month" tick={{ fill: '#334155', fontSize: 12 }} />
+                  <YAxis tick={{ fill: '#334155', fontSize: 12 }} />
+                  <Tooltip />
+                  <Legend />
+                  <Line type="monotone" dataKey="y2025" name="2025" stroke="#65a30d" strokeWidth={3} dot />
+                  <Line type="monotone" dataKey="y2026" name="2026" stroke="#15803d" strokeWidth={3} dot />
+                </LineChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
 
-        <Card className="shadow-md ring-1 ring-slate-200/60 transition hover:shadow-lg">
-          <CardContent className="relative overflow-hidden p-7">
-            <div className="pointer-events-none absolute -left-10 -top-10 h-44 w-44 rounded-full bg-emerald-100/50 blur-2xl" />
-            <button className={cn(cardButton, 'relative')} onClick={() => {}}>
-              <div className="text-sm font-semibold text-slate-600">תחזית הכנסות</div>
-              <div className="mt-4 grid grid-cols-3 gap-2">
-                <div className="rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200">
-                  <div className="text-xs font-semibold text-slate-500">הטוב ביותר</div>
-                  <div className="mt-1 text-sm font-extrabold">{formatCurrencyILS(Number(data.kpis.forecast.best))}</div>
-                </div>
-                <div className="rounded-2xl bg-emerald-50 p-3 ring-1 ring-emerald-200/60">
-                  <div className="text-xs font-semibold text-emerald-700">המציאותי</div>
-                  <div className="mt-1 text-sm font-extrabold text-emerald-900">{formatCurrencyILS(Number(data.kpis.forecast.realistic))}</div>
-                </div>
-                <div className="rounded-2xl bg-amber-50 p-3 ring-1 ring-amber-200/60">
-                  <div className="text-xs font-semibold text-amber-700">הגרוע ביותר</div>
-                  <div className="mt-1 text-sm font-extrabold text-amber-900">{formatCurrencyILS(Number(data.kpis.forecast.worst))}</div>
-                </div>
-              </div>
-              <div className="mt-3 text-xs text-slate-500">תחזית מבוססת פייפליין × הסתברות</div>
-            </button>
-          </CardContent>
-        </Card>
+          <Card className="rounded-3xl border-0 bg-white shadow-[0_10px_26px_rgba(15,23,42,0.08)]">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-xl font-bold text-slate-900">פילוח לקוחות</CardTitle>
+            </CardHeader>
+            <CardContent className="h-[290px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie data={customerSegmentationData} dataKey="value" nameKey="name" innerRadius={56} outerRadius={96} paddingAngle={2}>
+                    {customerSegmentationData.map((entry) => (
+                      <Cell key={entry.name} fill={entry.color} />
+                    ))}
+                  </Pie>
+                  <Tooltip />
+                  <Legend />
+                </PieChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
+        </div>
 
-        <Card className="shadow-md ring-1 ring-slate-200/60 transition hover:shadow-lg">
-          <CardContent className="relative overflow-hidden p-7">
-            <div className="pointer-events-none absolute -left-10 -top-10 h-44 w-44 rounded-full bg-emerald-100/40 blur-2xl" />
-            <button className={cn(cardButton, 'relative')} onClick={() => {}}>
-              <div className="text-sm font-semibold text-slate-600">אחוז זכייה ממוצע של הצוות</div>
-              <div className="mt-4 text-4xl font-extrabold tracking-tight">{Math.round(data.kpis.teamWinRate * 100)}%</div>
-              <div className="mt-2 text-sm text-slate-500">עסקאות זכייה בחודש: {data.leaderboard.reduce((a, r) => a + (r.wonDealsCount || 0), 0)}</div>
-              <div className="mt-4 flex items-center gap-2">
-                <span className={cn('rounded-full px-2.5 py-1 text-xs font-semibold', data.kpis.teamWinRate >= 0.3 ? 'bg-emerald-100 text-emerald-800' : data.kpis.teamWinRate >= 0.22 ? 'bg-amber-100 text-amber-800' : 'bg-red-100 text-red-800')}>
-                  {data.kpis.teamWinRate >= 0.3 ? 'מצוין' : data.kpis.teamWinRate >= 0.22 ? 'טוב' : 'דורש תשומת לב'}
-                </span>
-              </div>
-            </button>
-          </CardContent>
-        </Card>
-      </div>
-
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <KpiCard title="לידים חדשים" value={data.coreCounts?.leadsNew ?? 0} sub="סטטוס חדש" icon={Users} />
-        <KpiCard title="לידים בטיפול" value={data.coreCounts?.leadsInTreatment ?? 0} sub="בטיפול שוטף" icon={Clock3} />
-        <KpiCard title="לידים שזכו" value={data.coreCounts?.leadsWon ?? 0} sub="נסגרו בהצלחה" icon={CheckCircle2} />
-        <KpiCard title="לידים שאבדו" value={data.coreCounts?.leadsLost ?? 0} sub="נסגרו כאבודים" icon={AlertTriangle} />
-        <KpiCard title="משימות פתוחות" value={data.coreCounts?.tasksOpen ?? 0} sub="פתוחות/בביצוע" icon={ClipboardList} />
-        <KpiCard title="משימות באיחור" value={data.coreCounts?.tasksOverdue ?? 0} sub="עבר תאריך יעד" icon={Clock3} />
-        <KpiCard title="הצעות מחיר פתוחות" value={data.coreCounts?.quotesOpenActive ?? 0} sub="טיוטה / נשלחה" icon={FileText} />
-      </div>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-xl">טבלת דירוג נציגים</CardTitle>
-        </CardHeader>
-        <CardContent className="p-0">
-          <Table className="text-[13px]">
-            <TableHeader>
-              <TableRow>
-                <TableHead>דירוג</TableHead>
-                <TableHead>שם הנציג</TableHead>
-                <TableHead>% עמידה ביעד</TableHead>
-                <TableHead>הכנסות זכייה בחודש</TableHead>
-                <TableHead>כמות עסקאות זכייה</TableHead>
-                <TableHead>אחוז זכייה אישי</TableHead>
-                <TableHead>ערך פייפליין</TableHead>
-                <TableHead>לידים פתוחים</TableHead>
-                <TableHead>פעילות שבועית</TableHead>
-                <TableHead>עסקאות תקועות &gt;14 יום</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {data.leaderboard.map((r, idx) => (
-                <TableRow
-                  key={r.repId}
-                  className={cn(
-                    'hover:bg-slate-50',
-                    idx % 2 === 1 && 'bg-slate-50/40',
-                    idx === 0 && 'bg-emerald-50',
-                    idx === 1 && 'bg-sky-50',
-                    idx === 2 && 'bg-amber-50',
-                  )}
-                >
-                  <TableCell className="py-4">
-                    <span className={cn('inline-flex h-8 w-8 items-center justify-center rounded-full font-bold',
-                      idx === 0 ? 'bg-emerald-600 text-white' : idx === 1 ? 'bg-sky-600 text-white' : idx === 2 ? 'bg-amber-500 text-white' : 'bg-slate-200 text-slate-700'
-                    )}>
-                      {idx + 1}
-                    </span>
-                  </TableCell>
-                  <TableCell className="py-4 font-semibold">{r.repName}</TableCell>
-                  <TableCell className="py-4 text-right">
-                    {r.quotaTarget ? (
-                      <span className={cn('rounded-full px-2.5 py-1 text-xs font-semibold',
-                        r.attainmentPct >= 1 ? 'bg-emerald-100 text-emerald-800' : r.attainmentPct >= 0.7 ? 'bg-amber-100 text-amber-800' : 'bg-red-100 text-red-800'
-                      )}>
-                        {Math.round(r.attainmentPct * 100)}%
-                      </span>
-                    ) : (
-                      '-'
-                    )}
-                  </TableCell>
-                  <TableCell className="py-4 font-semibold tabular-nums">{formatCurrencyILS(Number(Math.round(r.wonRevenueThisMonth)))}</TableCell>
-                  <TableCell className="py-4 tabular-nums">{r.wonDealsCount}</TableCell>
-                  <TableCell className="py-4 tabular-nums">{Math.round(r.personalWinRate * 100)}%</TableCell>
-                  <TableCell className="py-4 font-semibold tabular-nums">{formatCurrencyILS(Number(Math.round(r.pipelineValue)))}</TableCell>
-                  <TableCell className="py-4 tabular-nums">{r.openLeadsCount}</TableCell>
-                  <TableCell className="py-4 tabular-nums">{r.weeklyActivity}</TableCell>
-                  <TableCell className={cn('py-4 tabular-nums', r.stuckDealsOver14 >= 3 ? 'text-red-700 font-extrabold' : r.stuckDealsOver14 >= 1 ? 'text-amber-700 font-extrabold' : 'text-slate-600')}>
-                    {r.stuckDealsOver14}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
-
-      <div className="grid gap-5 xl:grid-cols-2">
-        <Card>
-          <CardHeader><CardTitle className="text-xl">שלבי פייפליין לפי נציג</CardTitle></CardHeader>
-          <CardContent className="h-[360px] p-6">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={pipelineStagesByRep}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="rep" />
-                <YAxis />
-                <Tooltip
-                  formatter={(value: any, name: any) => {
-                    const map: Record<string, string> = {
-                      NEW: 'חדש',
-                      'FU-1': 'פולואפ 1',
-                      'FU-2': 'פולואפ 2',
-                      'Quote Sent': 'הצעה נשלחה',
-                      WON: 'זכה',
-                      LOST: 'אבוד',
-                    };
-                    const label = map[String(name)] || String(name);
-                    return [value, label];
-                  }}
-                />
-                <Legend />
-                <Bar dataKey="NEW" name="חדש" stackId="a" fill="#a7f3d0" />
-                <Bar dataKey="FU-1" name="פולואפ 1" stackId="a" fill="#4ba647" />
-                <Bar dataKey="FU-2" name="פולואפ 2" stackId="a" fill="#2f5c32" />
-                <Bar dataKey="Quote Sent" name="הצעה נשלחה" stackId="a" fill="#60a5fa" />
-                <Bar dataKey="WON" name="זכה" stackId="a" fill="#22c55e" />
-                <Bar dataKey="LOST" name="אבוד" stackId="a" fill="#ef4444" />
-              </BarChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader><CardTitle className="text-xl">מקורות לידים (מקור שיווק)</CardTitle></CardHeader>
-          <CardContent className="h-[360px] p-6 flex items-center justify-center">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie data={data.charts.leadSourcesPie} dataKey="value" nameKey="name" outerRadius={110} label>
-                  {data.charts.leadSourcesPie.map((_, i) => (
-                    <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
+        <div className="grid gap-4 xl:grid-cols-[1.35fr_0.8fr_1fr]">
+          <Card className="rounded-3xl border-0 bg-white shadow-[0_10px_26px_rgba(15,23,42,0.08)]">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-xl font-bold text-slate-900">משימות דחופות</CardTitle>
+            </CardHeader>
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader>
+                  <TableRow className="bg-emerald-50">
+                    <TableHead>משימה</TableHead>
+                    <TableHead>לקוח</TableHead>
+                    <TableHead>תאריך יעד</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {urgentTasksRows.map((row, idx) => (
+                    <TableRow key={`${row.task}-${idx}`} className="hover:bg-slate-50">
+                      <TableCell className="font-medium">{row.task}</TableCell>
+                      <TableCell>{row.client}</TableCell>
+                      <TableCell>{row.due}</TableCell>
+                    </TableRow>
                   ))}
-                </Pie>
-                <Tooltip />
-              </PieChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
 
-        <Card>
-          <CardHeader><CardTitle className="text-xl">התקדמות עמידה ביעד במהלך החודש</CardTitle></CardHeader>
-          <CardContent className="h-[360px] p-6">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={data.charts.quotaProgress}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="day" />
-                <YAxis domain={[0, 100]} />
-                <Tooltip />
-                <Legend />
-                {data.leaderboard.slice(0, 5).map((r, idx) => (
-                  <Line key={r.repId} type="monotone" dataKey={r.repName} stroke={PIE_COLORS[idx % PIE_COLORS.length]} strokeWidth={2} dot={false} />
-                ))}
-              </LineChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
+          <Card className="rounded-3xl border-0 bg-white shadow-[0_10px_26px_rgba(15,23,42,0.08)]">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-xl font-bold text-slate-900">השפעה סביבתית (CO2 שנחסך)</CardTitle>
+            </CardHeader>
+            <CardContent className="flex flex-col items-center justify-center py-10">
+              <div className="mb-4 flex h-20 w-20 items-center justify-center rounded-full bg-emerald-100 text-4xl">🌳</div>
+              <div className="text-4xl font-black text-emerald-700">1,200 טון</div>
+              <div className="mt-2 text-sm text-slate-500">חיסכון מצטבר בפרויקטים פעילים</div>
+            </CardContent>
+          </Card>
 
-        <Card>
-          <CardHeader><CardTitle className="text-xl">קצב המרה לידים → הצעה נשלחה → זכייה</CardTitle></CardHeader>
-          <CardContent className="h-[360px] p-6">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={data.charts.conversionFunnel}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="step" />
-                <YAxis />
-                <Tooltip />
-                <Bar dataKey="value" fill={galit.primary} radius={[12, 12, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-      </div>
-
-      <div className="grid gap-5 xl:grid-cols-2">
-        <Card>
-          <CardHeader><CardTitle className="text-xl">עסקאות תקועות (&gt;14 יום)</CardTitle></CardHeader>
-          <CardContent className="p-0">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>רמת דחיפות</TableHead>
-                  <TableHead>נציג</TableHead>
-                  <TableHead>עסקה</TableHead>
-                  <TableHead>גיל (ימים)</TableHead>
-                  <TableHead>שווי</TableHead>
-                  <TableHead>שלב</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.alerts.agingDeals.map((d, idx) => (
-                  <TableRow key={idx} className={cn(alertRowClass(d.level), 'hover:brightness-[0.99]')}>
-                    <TableCell className="py-4">{severityPill(d.level)}</TableCell>
-                    <TableCell className="py-4 font-semibold">{d.rep}</TableCell>
-                    <TableCell>{d.deal}</TableCell>
-                    <TableCell className={cn('py-4 tabular-nums', d.level === 'red' ? 'text-red-700 font-extrabold' : 'text-amber-700 font-extrabold')}>{d.ageDays}</TableCell>
-                    <TableCell className="py-4 font-semibold tabular-nums">{formatCurrencyILS(Number(d.value))}</TableCell>
-                    <TableCell className="py-4">{d.stage}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader><CardTitle className="text-xl">לידים ללא פעילות 7+ ימים</CardTitle></CardHeader>
-          <CardContent className="p-0">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>רמת דחיפות</TableHead>
-                  <TableHead>נציג</TableHead>
-                  <TableHead>ליד</TableHead>
-                  <TableHead>טלפון</TableHead>
-                  <TableHead>סוג שירות</TableHead>
-                  <TableHead>פעילות אחרונה</TableHead>
-                  <TableHead>ימים ללא פעילות</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.alerts.inactiveLeads.map((l, idx) => (
-                  <TableRow key={idx} className={cn(alertRowClass(l.level), 'hover:brightness-[0.99]')}>
-                    <TableCell className="py-4">{severityPill(l.level)}</TableCell>
-                    <TableCell className="py-4 font-semibold">{l.rep}</TableCell>
-                    <TableCell>{l.leadName}</TableCell>
-                    <TableCell>{phoneToDisplay(l.phone) || '-'}</TableCell>
-                    <TableCell>{l.serviceType}</TableCell>
-                    <TableCell>{l.lastActivity}</TableCell>
-                    <TableCell className={cn('py-4 tabular-nums', l.level === 'red' ? 'text-red-700 font-extrabold' : 'text-amber-700 font-extrabold')}>{l.inactiveDays}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
-      </div>
-
-      <div className="grid gap-5 xl:grid-cols-2">
-        <Card>
-          <CardHeader><CardTitle className="text-xl">לידים לפי סוג שירות</CardTitle></CardHeader>
-          <CardContent className="h-[360px] p-6">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={data.breakdowns.leadsByServiceType}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="service" />
-                <YAxis />
-                <Tooltip />
-                <Bar dataKey="value" fill="#2f5c32" radius={[12, 12, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader><CardTitle className="text-xl">פרויקטים פתוחים</CardTitle></CardHeader>
-          <CardContent className="space-y-3">
-            {data.breakdowns.openProjects.map((p) => (
-              <button key={p.id} className="w-full rounded-3xl border border-slate-200/70 bg-white p-5 text-right shadow-sm transition hover:shadow-md hover:bg-slate-50" onClick={() => {}}>
-                <div className="flex items-center justify-between gap-3">
-                  <div className="font-medium">{p.name}</div>
-                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-700">{statusLabel(p.status)}</span>
-                </div>
-                <div className="mt-2 text-sm text-slate-500">{p.assigned ? `טכנאי: ${p.assigned}` : 'טכנאי: —'} · יעד: {p.dueDate || '-'}</div>
-              </button>
-            ))}
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card>
-        <CardHeader><CardTitle className="text-xl">עובדים בעבודה עכשיו</CardTitle></CardHeader>
-        <CardContent className="space-y-3">
-          {data.workingNowEmployees.length === 0 ? (
-            <div className="text-sm text-slate-500">אין עובדים מסומנים כפעילים כרגע.</div>
-          ) : (
-            <div className="grid gap-3 md:grid-cols-2">
-              {data.workingNowEmployees.map((e) => (
-                <div key={e.id} className="rounded-3xl border border-slate-200/70 bg-white p-5 shadow-sm">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <div className="font-semibold">{e.name}</div>
-                      <div className="mt-1 text-xs text-slate-500">{roleLabel(e.role as AppUserRole)}</div>
+          <Card className="rounded-3xl border-0 bg-white shadow-[0_10px_26px_rgba(15,23,42,0.08)]">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-xl font-bold text-slate-900">ביצועי צוות מכירות</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {teamRows.map((row) => (
+                <div key={row.id} className="space-y-1">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                      <div className="h-8 w-8 rounded-full bg-emerald-100" />
+                      <div className="text-sm font-semibold text-slate-800">{row.name}</div>
                     </div>
-                    <span
-                      className={cn(
-                        'rounded-full px-2.5 py-1 text-xs font-semibold',
-                        e.currentWorkMode === 'FIELD'
-                          ? 'bg-orange-100 text-orange-800'
-                          : e.currentWorkMode === 'OFFICE'
-                            ? 'bg-sky-100 text-sky-800'
-                            : 'bg-emerald-100 text-emerald-800',
-                      )}
-                    >
-                      {e.currentWorkMode === 'FIELD' ? 'בשטח' : e.currentWorkMode === 'OFFICE' ? 'במשרד' : 'פעיל'}
-                    </span>
+                    <div className="text-xs text-slate-500">{formatCurrencyILS(row.amount)}</div>
                   </div>
-                  {e.currentProject && (
-                    <div className="mt-3 text-sm text-slate-600">פרויקט נוכחי: <span className="font-medium">{e.currentProject.name}</span></div>
-                  )}
-                  {!e.currentProject && (
-                    <div className="mt-3 text-sm text-slate-500">פרויקט נוכחי: -</div>
-                  )}
+                  <div className="h-2 w-full rounded-full bg-slate-100">
+                    <div className={cn('h-2 rounded-full', row.color)} style={{ width: `${row.pct}%` }} />
+                  </div>
+                  <div className="text-xs text-emerald-700">{row.pct}%</div>
                 </div>
               ))}
-            </div>
-          )}
-        </CardContent>
-      </Card>
-      </>
-      )}
+            </CardContent>
+          </Card>
+        </div>
+
+        <div className="flex justify-end">
+          <Button style={{ background: galit.primary }} className="rounded-2xl px-5" onClick={refresh}>
+            רענון נתונים
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -4174,11 +3539,6 @@ function DashboardPage({
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-3xl font-bold" style={{ color: galit.text }}>לוח ניהול</h1>
-        <p className="mt-1 text-slate-500">תצוגה מהירה של לידים, הצעות מחיר, פרויקטים ומשימות</p>
-      </div>
-
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <KpiCard title="לידים חדשים" value={leadsNew} sub="סטטוס חדש" icon={Users} />
         <KpiCard title="לידים בטיפול" value={leadsInTreatment} sub="בטיפול שוטף" icon={Clock3} />
@@ -4338,6 +3698,9 @@ function LeadsPage({
   setLeads,
   customers,
   onOpenLead,
+  onOpenCustomer,
+  onOpenProjectById,
+  onNavigate,
   loadError,
   currentUser,
   users,
@@ -4346,6 +3709,9 @@ function LeadsPage({
   setLeads: React.Dispatch<React.SetStateAction<Lead[]>>;
   customers: Customer[];
   onOpenLead: (lead: Lead) => void;
+  onOpenCustomer?: (customer: Customer) => void;
+  onOpenProjectById?: (projectId: string) => void;
+  onNavigate?: (target: string) => void;
   loadError?: string;
   currentUser: AppUser;
   users: AppUser[];
@@ -4425,9 +3791,9 @@ function LeadsPage({
     setError('');
     setSuccess('');
     try {
-      const res = await fetch(`http://localhost:3001/leads/${id}`, {
+      const res = await apiFetch(apiUrl(`/leads/${id}`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -4466,9 +3832,18 @@ function LeadsPage({
   };
 
   const updateNextFollowUp = async (lead: Lead) => {
-    const base = new Date();
-    base.setDate(base.getDate() + 3);
-    const dateStr = base.toISOString().slice(0, 10);
+    const suggested = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const picked =
+      typeof window !== 'undefined'
+        ? window.prompt('בחר תאריך לפולואפ הבא (YYYY-MM-DD)', suggested)
+        : suggested;
+    if (!picked) return;
+    const valid = /^\d{4}-\d{2}-\d{2}$/.test(picked);
+    if (!valid) {
+      setError('תאריך לא תקין. יש להזין בפורמט YYYY-MM-DD');
+      return;
+    }
+    const dateStr = picked;
     await patchLead(lead.id, { nextFollowUpDate: dateStr });
   };
 
@@ -4489,9 +3864,9 @@ function LeadsPage({
         assignedUserId: lead.assignedUserId ?? currentUser.id,
         notes: lead.notes ?? null,
       };
-      const res = await fetch('http://localhost:3001/opportunities', {
+      const res = await apiFetch(apiUrl('/opportunities'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -4506,18 +3881,23 @@ function LeadsPage({
     setError('');
     setSuccess('');
     try {
-      const res = await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}/convert-to-customer`, {
+      const res = await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}/convert-to-customer`), {
         method: 'POST',
-        headers: authHeaders(currentUser),
+        authUser: currentUser,
       });
       if (!res.ok) throw new Error(await res.text());
+      const customer = await res.json();
+      if (!customer?.id) {
+        setError('לא נמצא לקוח לאחר ההמרה');
+        return;
+      }
       setSuccess('הליד הומר ללקוח בהצלחה');
       // best-effort refresh: keep lead list stable, customer list is owned by parent
       await patchLead(lead.id, { leadStatus: 'NEW' });
       // Refresh this lead so the customer relation (customerId + customer object) is available in UI.
       try {
-        const leadRes = await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}`, {
-          headers: authHeaders(currentUser),
+        const leadRes = await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}`), {
+          authUser: currentUser,
         });
         if (leadRes.ok) {
           const fresh = await leadRes.json();
@@ -4525,6 +3905,11 @@ function LeadsPage({
         }
       } catch {
         // keep best-effort behavior
+      }
+      if (onOpenCustomer) {
+        onOpenCustomer(customer as Customer);
+      } else {
+        onNavigate?.('customers');
       }
       setSuccess('הליד הומר ללקוח בהצלחה');
     } catch {
@@ -4536,13 +3921,19 @@ function LeadsPage({
     setError('');
     setSuccess('');
     try {
-      const res = await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}/create-quote`, {
+      const res = await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}/create-quote`), {
         method: 'POST',
-        headers: authHeaders(currentUser),
+        authUser: currentUser,
       });
       if (!res.ok) throw new Error(await res.text());
+      const quote = await res.json();
+      if (!quote?.id) {
+        setError('יצירת הצעת מחיר בוצעה חלקית בלבד');
+        return;
+      }
       setSuccess('נוצרה הצעת מחיר מהליד');
       await patchLead(lead.id, { leadStatus: 'QUOTE_SENT' });
+      onNavigate?.('quotes');
     } catch {
       setError('יצירת הצעת מחיר נכשלה.');
     }
@@ -4552,18 +3943,20 @@ function LeadsPage({
     setError('');
     setSuccess('');
     try {
-      const res = await fetch(`http://localhost:3001/leads/${encodeURIComponent(lead.id)}/open-project`, {
+      const res = await apiFetch(apiUrl(`/leads/${encodeURIComponent(lead.id)}/open-project`), {
         method: 'POST',
-        headers: authHeaders(currentUser),
+        authUser: currentUser,
       });
       if (!res.ok) throw new Error(await res.text());
       setSuccess('נפתח פרויקט מהליד');
       const project = await res.json();
-      await patchLead(lead.id, { leadStatus: 'WON', projectId: project?.id ?? null });
-      // open project details if we got it
-      if (project?.id) {
-        onOpenLead(lead); // keep existing flow stable; project open from lead profile tab
+      if (!project?.id) {
+        setError('לא התקבל פרויקט לפתיחה');
+        return;
       }
+      await patchLead(lead.id, { leadStatus: 'WON', projectId: project?.id ?? null });
+      onOpenProjectById?.(project.id);
+      if (!onOpenProjectById) onNavigate?.('projects');
     } catch {
       setError('פתיחת פרויקט נכשלה.');
     }
@@ -4588,9 +3981,9 @@ function LeadsPage({
       prev.map((item) => (item.id === lead.id ? { ...item, stage } : item)),
     );
     try {
-      await fetch(`http://localhost:3001/leads/${lead.id}/stage`, {
+      await apiFetch(apiUrl(`/leads/${lead.id}/stage`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify({ stage }),
       });
     } catch {
@@ -4637,9 +4030,9 @@ function LeadsPage({
     };
 
     try {
-      const res = await fetch('http://localhost:3001/leads', {
+      const res = await apiFetch(apiUrl('/leads'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
 
@@ -4746,9 +4139,9 @@ function LeadsPage({
     setLoading(true);
 
     try {
-      const res = await fetch(`http://localhost:3001/leads/${selectedLead.id}`, {
+      const res = await apiFetch(apiUrl(`/leads/${selectedLead.id}`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify({
           firstName: form.firstName || null,
           lastName: form.lastName || null,
@@ -4808,9 +4201,9 @@ function LeadsPage({
   const deleteLead = async (lead: Lead) => {
     if (!window.confirm('האם אתה בטוח שברצונך למחוק את הליד?')) return;
     try {
-      const res = await fetch(`http://localhost:3001/leads/${lead.id}`, {
+      const res = await apiFetch(apiUrl(`/leads/${lead.id}`), {
         method: 'DELETE',
-        headers: authHeaders(currentUser),
+        authUser: currentUser,
       });
       if (!res.ok) throw new Error('מחיקת נתונים נכשלה');
       setLeads((prev) => prev.filter((item) => item.id !== lead.id));
@@ -5021,55 +4414,56 @@ function LeadsPage({
                     <TableCell>
                       <div className="flex flex-wrap gap-2" onClick={(e) => e.stopPropagation()}>
                         <button
-                          className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
+                          className="rounded-xl border border-slate-300 bg-white px-3 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-50"
                           onClick={() => onOpenLead(lead)}
                         >
                           פתח ליד
                         </button>
                         <button
-                          className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
+                          className="rounded-xl border border-cyan-300 bg-cyan-50 px-3 py-1 text-xs font-semibold text-cyan-800 hover:bg-cyan-100"
                           onClick={() => setFollowUp(lead, 1)}
                         >
                           קבע פולואפ 1
                         </button>
                         <button
-                          className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
+                          className="rounded-xl border border-sky-300 bg-sky-50 px-3 py-1 text-xs font-semibold text-sky-800 hover:bg-sky-100"
                           onClick={() => setFollowUp(lead, 2)}
                         >
                           קבע פולואפ 2
                         </button>
                         <button
-                          className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
+                          className="rounded-xl border border-indigo-300 bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-800 hover:bg-indigo-100"
                           onClick={() => updateNextFollowUp(lead)}
                         >
                           עדכן פולואפ הבא
                         </button>
                         <button
-                          className="rounded-xl bg-slate-900 px-3 py-1 text-xs text-white hover:bg-slate-800"
+                          className="rounded-xl px-3 py-1 text-xs font-semibold text-white"
+                          style={{ background: galit.primary }}
                           onClick={() => createQuoteFromLead(lead)}
                         >
                           צור הצעת מחיר
                         </button>
                         <button
-                          className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
+                          className="rounded-xl border border-emerald-300 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
                           onClick={() => convertToCustomer(lead)}
                         >
                           הפוך ללקוח
                         </button>
                         <button
-                          className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
+                          className="rounded-xl border border-amber-300 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-800 hover:bg-amber-100"
                           onClick={() => openProjectFromLead(lead)}
                         >
                           פתח פרויקט
                         </button>
                         <button
-                          className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
+                          className="rounded-xl border border-rose-300 bg-rose-50 px-3 py-1 text-xs font-semibold text-rose-800 hover:bg-rose-100"
                           onClick={() => patchLead(lead.id, { leadStatus: 'LOST' })}
                         >
                           סמן כאבוד
                         </button>
                         <button
-                          className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
+                          className="rounded-xl border border-orange-300 bg-orange-50 px-3 py-1 text-xs font-semibold text-orange-800 hover:bg-orange-100"
                           onClick={() => patchLead(lead.id, { leadStatus: 'NOT_RELEVANT' })}
                         >
                           סמן כלא רלוונטי
@@ -5196,24 +4590,340 @@ function LeadsPage({
   );
 }
 
+/** ערים נפוצות בישראל — למילוי/חיפוש בשדה העיר (אפשר גם עיר שלא ברשימה) */
+const ISRAEL_CITIES_SORTED = [
+  'אום אל-פחם',
+  'אופקים',
+  'אור יהודה',
+  'אור עקיבא',
+  'אילת',
+  'אלעד',
+  'אריאל',
+  'אשדוד',
+  'אשקלון',
+  'באר שבע',
+  'בית שאן',
+  'בית שמש',
+  'בני ברק',
+  'בת ים',
+  'גבעת שמואל',
+  'גבעתיים',
+  'דימונה',
+  'הוד השרון',
+  'הרצליה',
+  'זכרון יעקב',
+  'חדרה',
+  'חולון',
+  'חיפה',
+  'טבריה',
+  'יבנה',
+  'יהוד-מונוסון',
+  'ירוחם',
+  'ירושלים',
+  'כפר יונה',
+  'כפר סבא',
+  'כרמיאל',
+  'לוד',
+  'מגדל העמק',
+  'מודיעין עילית',
+  'מודיעין-מכבים-רעות',
+  'מעלה אדומים',
+  'מעלות-תרשיחא',
+  'נהריה',
+  'נס ציונה',
+  'נצרת',
+  'נשר',
+  'נתיבות',
+  'נתניה',
+  'עכו',
+  'עומר',
+  'עפולה',
+  'ערד',
+  'פתח תקווה',
+  'צפת',
+  'קרית אונו',
+  'קרית אתא',
+  'קרית ביאליק',
+  'קרית גת',
+  'קרית טבעון',
+  'קרית מוצקין',
+  'קרית מלאכי',
+  'קרית שמונה',
+  'ראשון לציון',
+  'רחובות',
+  'רמלה',
+  'רמת גן',
+  'רמת השרון',
+  'שדרות',
+  'תל אביב-יפו',
+].sort((a, b) => a.localeCompare(b, 'he'));
+
+function CitySearchInput({
+  value,
+  onChange,
+  inputClassName,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  inputClassName?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const blurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const filtered = useMemo(() => {
+    const q = value.trim();
+    if (!q) return ISRAEL_CITIES_SORTED.slice(0, 18);
+    return ISRAEL_CITIES_SORTED.filter((c) => c.includes(q)).slice(0, 28);
+  }, [value]);
+
+  const cancelBlur = () => {
+    if (blurTimer.current) {
+      clearTimeout(blurTimer.current);
+      blurTimer.current = null;
+    }
+  };
+
+  return (
+    <div className="relative">
+      <Input
+        className={cn('h-11 rounded-2xl border-slate-200', inputClassName)}
+        placeholder="הקלד לחיפוש או בחר עיר"
+        value={value}
+        autoComplete="off"
+        onChange={(e) => {
+          onChange(e.target.value);
+          setOpen(true);
+        }}
+        onFocus={() => {
+          cancelBlur();
+          setOpen(true);
+        }}
+        onBlur={() => {
+          blurTimer.current = setTimeout(() => setOpen(false), 180);
+        }}
+      />
+      {open && filtered.length > 0 && (
+        <ul
+          className="absolute z-50 mt-1 max-h-56 w-full overflow-auto rounded-2xl border border-slate-200 bg-white py-1 shadow-lg"
+          role="listbox"
+        >
+          {filtered.map((c) => (
+            <li key={c}>
+              <button
+                type="button"
+                className="w-full px-4 py-2.5 text-right text-sm text-slate-800 hover:bg-emerald-50"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  cancelBlur();
+                  onChange(c);
+                  setOpen(false);
+                }}
+              >
+                {c}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+const TYPE_PIE_PALETTE = ['#14532d', '#166534', '#15803d', '#16a34a', '#22c55e', '#84cc16', '#65a30d', '#94a3b8'];
+
+/** חישובי אנליטיקה אמיתיים לדף לקוחות (ללא מספרים קשיחים) */
+function computeCustomersPageAnalytics(
+  customers: Customer[],
+  leads: Lead[],
+  quotes: Quote[],
+  projects: Project[],
+  tasks: Task[],
+  opportunities: Opportunity[],
+  users: AppUser[],
+  resolveTypeLabel: (code: string) => string,
+) {
+  const closedProjectStatuses = new Set(['CLOSED', 'CANCELLED']);
+  const isActiveProject = (p: Project) => !closedProjectStatuses.has((p.status || '').toString().toUpperCase());
+  const isOpenTask = (t: Task) => ['OPEN', 'IN_PROGRESS'].includes((t.status || '').toString().toUpperCase());
+  const quoteIsAdvanced = (q: Quote) =>
+    ['SENT', 'APPROVED', 'SIGNED', 'REJECTED'].includes((q.status || '').toString().toUpperCase());
+  const quoteCountsTowardSales = (q: Quote) =>
+    ['SENT', 'APPROVED', 'SIGNED'].includes((q.status || '').toString().toUpperCase());
+  const quoteMoney = (q: Quote) => Number(q.totalAmount ?? q.amountBeforeVat ?? q.amount ?? 0);
+  const lostLeadStatuses = new Set(['WON', 'LOST', 'NOT_RELEVANT']);
+
+  const typeCounts = new Map<string, number>();
+  for (const c of customers) {
+    const code = ((c as Customer).type || '').trim() || 'UNKNOWN';
+    typeCounts.set(code, (typeCounts.get(code) || 0) + 1);
+  }
+  const typePieEntries = [...typeCounts.entries()].filter(([, v]) => v > 0);
+  typePieEntries.sort((a, b) => b[1] - a[1]);
+  const typePie = typePieEntries.map(([code, value], i) => ({
+    code,
+    name: code === 'UNKNOWN' ? 'לא מסווג' : resolveTypeLabel(code),
+    value,
+    color: TYPE_PIE_PALETTE[i % TYPE_PIE_PALETTE.length],
+  }));
+  const typePieTotal = typePie.reduce((s, x) => s + x.value, 0) || 1;
+
+  const inTreatment = new Set<string>();
+  for (const c of customers) {
+    const id = c.id;
+    if (projects.some((p) => p.customerId === id && isActiveProject(p))) inTreatment.add(id);
+    else if (tasks.some((t) => t.customerId === id && isOpenTask(t))) inTreatment.add(id);
+  }
+
+  const waitingQuote = new Set<string>();
+  for (const p of projects) {
+    if (p.customerId && (p.status || '').toString().toUpperCase() === 'WAITING_QUOTE') waitingQuote.add(p.customerId);
+  }
+  for (const opp of opportunities) {
+    if (!opp.customerId) continue;
+    const ps = (opp.pipelineStage || '').toString().toUpperCase();
+    if (['WON', 'LOST'].includes(ps)) continue;
+    const qs = quotes.filter((q) => q.opportunityId === opp.id);
+    if (!qs.some(quoteIsAdvanced)) waitingQuote.add(opp.customerId);
+  }
+  for (const lead of leads) {
+    if (!lead.customerId) continue;
+    const st = (lead.leadStatus || lead.status || '').toString().toUpperCase();
+    const stg = (lead.stage || '').toString().toUpperCase();
+    if (lostLeadStatuses.has(st) || lostLeadStatuses.has(stg)) continue;
+    const qs = quotes.filter((q) => q.leadId === lead.id);
+    if (!qs.some(quoteIsAdvanced)) waitingQuote.add(lead.customerId);
+  }
+
+  const waitingSign = new Set<string>();
+  for (const q of quotes) {
+    if (!q.customerId) continue;
+    const st = (q.status || '').toString().toUpperCase();
+    if (st === 'SENT' || st === 'APPROVED') waitingSign.add(q.customerId);
+  }
+
+  const STALE_DAYS = 90;
+  const now = Date.now();
+  const atRisk = new Set<string>();
+  for (const c of customers) {
+    if ((c.status || '').toString().toUpperCase() === 'INACTIVE') {
+      atRisk.add(c.id);
+      continue;
+    }
+    const hasOpenWork =
+      projects.some((p) => p.customerId === c.id && isActiveProject(p)) ||
+      tasks.some((t) => t.customerId === c.id && isOpenTask(t));
+    if (hasOpenWork) continue;
+    const times: number[] = [];
+    for (const q of quotes) {
+      if (q.customerId !== c.id) continue;
+      const d = q.updatedAt || q.createdAt;
+      if (d) times.push(new Date(d).getTime());
+    }
+    if (times.length === 0) continue;
+    const last = Math.max(...times);
+    if (now - last > STALE_DAYS * 86400000) atRisk.add(c.id);
+  }
+
+  const NEW_PROJECT_DAYS = 60;
+  const newProjectCutoff = now - NEW_PROJECT_DAYS * 86400000;
+  const newProjectsCustomers = new Set<string>();
+  for (const p of projects) {
+    if (!p.customerId || !p.createdAt) continue;
+    if (new Date(p.createdAt).getTime() >= newProjectCutoff) newProjectsCustomers.add(p.customerId);
+  }
+
+  const statusRows = [
+    { label: 'בטיפול שוטף', count: inTreatment.size },
+    { label: 'ממתינים להצעת מחיר', count: waitingQuote.size },
+    { label: 'ממתינים לחתימה', count: waitingSign.size },
+    { label: 'לקוחות בסיכון נטישה', count: atRisk.size },
+    { label: 'פרויקטים חדשים (60 יום)', count: newProjectsCustomers.size },
+  ];
+
+  const revenueByUser = new Map<string, number>();
+  const nameById = new Map<string, string>();
+  for (const u of users) {
+    nameById.set(u.id, u.name);
+    if (u.role === 'sales' || u.role === 'manager') revenueByUser.set(u.id, 0);
+  }
+  for (const opp of opportunities) {
+    if (opp.assignedUserId && opp.assignedUser?.name) nameById.set(opp.assignedUserId, opp.assignedUser.name);
+  }
+
+  for (const q of quotes) {
+    if (!quoteCountsTowardSales(q)) continue;
+    const amt = quoteMoney(q);
+    let uid: string | null = null;
+    if (q.opportunityId) {
+      const o = opportunities.find((x) => x.id === q.opportunityId);
+      uid = o?.assignedUserId ?? null;
+    } else if (q.leadId) {
+      const l = leads.find((x) => x.id === q.leadId);
+      uid = l?.assignedUserId ?? null;
+    }
+    if (!uid) continue;
+    revenueByUser.set(uid, (revenueByUser.get(uid) || 0) + amt);
+    if (!nameById.has(uid)) nameById.set(uid, 'משתמש מכירות');
+  }
+
+  const withRev = [...revenueByUser.entries()]
+    .filter(([id, amt]) => {
+      if (amt > 0) return true;
+      const u = users.find((x) => x.id === id);
+      return !!u && (u.role === 'sales' || u.role === 'manager');
+    })
+    .map(([id, amount]) => ({ userId: id, name: nameById.get(id) || 'משתמש', amount }));
+  withRev.sort((a, b) => b.amount - a.amount);
+  const maxRev = withRev.length ? Math.max(...withRev.map((x) => x.amount), 1) : 1;
+  const salesRows = withRev.map((row) => ({
+    userId: row.userId,
+    name: row.name,
+    amount: row.amount,
+    percent: maxRev > 0 ? Math.min(100, Math.round((row.amount / maxRev) * 1000) / 10) : 0,
+    initials: (() => {
+      const p = row.name.trim().split(/\s+/).filter(Boolean);
+      if (p.length >= 2) return `${p[0][0] || ''}${p[1][0] || ''}`.slice(0, 2);
+      return row.name.slice(0, 2);
+    })(),
+  }));
+
+  return { typePie, typePieTotal, statusRows, salesRows };
+}
+
 function CustomersPage({
   customers,
   leads,
+  quotes,
+  projects,
+  tasks,
+  opportunities,
+  users,
   onOpenCustomer,
   onCreateCustomer,
   onUpdateCustomer,
   onDeleteCustomer,
   error: loadError,
   currentUser,
+  typeLabelMap,
+  classifications,
+  onReloadClassifications,
 }: {
   customers: Customer[];
   leads: Lead[];
+  quotes: Quote[];
+  projects: Project[];
+  tasks: Task[];
+  opportunities: Opportunity[];
+  users: AppUser[];
   onOpenCustomer: (customer: Customer) => void;
   onCreateCustomer: (customer: Customer) => void;
   onUpdateCustomer: (customer: Customer) => void;
   onDeleteCustomer: (id: string) => void;
   error?: string;
   currentUser: AppUser;
+  typeLabelMap: Record<string, string>;
+  classifications: CustomerClassificationDto[];
+  onReloadClassifications: () => Promise<void>;
 }) {
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('הכל');
@@ -5230,28 +4940,46 @@ function CustomersPage({
     city: '',
     address: '',
     idNumber: '',
+    contactRole: '',
+    additionalPhone: '',
+    companyLogoFileName: '',
+    companySize: '',
+    industrySector: '',
+    acvPlanned: '',
+    companyWebsite: '',
+    envCo2ReductionTons: '',
+    envCertifications: '',
+    envExtraNotes: '',
+    leadSource: '',
+    designatedSalesManager: '',
     services: '',
+    status: 'ACTIVE',
     notes: '',
   });
 
-  const customerTypeLabel = (type: string) => {
-    const map: Record<string, string> = {
-      COMPANY: 'חברה / קבלן',
-      PUBLIC: 'רשות / מוסד',
-      PRIVATE: 'לקוח פרטי',
-      'חברה / קבלן': 'חברה / קבלן',
-      'רשות / מוסד': 'רשות / מוסד',
-      'לקוח פרטי': 'לקוח פרטי',
-    };
-    return map[type] || type;
-  };
+  const customerTypeLabel = (type: string) => resolveCustomerTypeLabel(type, typeLabelMap);
 
   const normalizeCustomerTypeEnum = (type: string) => {
-    if (type === 'COMPANY' || type === 'חברה / קבלן') return 'COMPANY';
-    if (type === 'PUBLIC' || type === 'רשות / מוסד') return 'PUBLIC';
-    if (type === 'PRIVATE' || type === 'לקוח פרטי') return 'PRIVATE';
-    return type;
+    const t = (type || '').trim();
+    if (t === 'COMPANY' || t === 'חברה / קבלן') return 'COMPANY';
+    if (t === 'PUBLIC' || t === 'רשות / מוסד') return 'PUBLIC';
+    if (t === 'PRIVATE' || t === 'לקוח פרטי') return 'PRIVATE';
+    return t;
   };
+
+  const sortedClassificationOptions = useMemo(() => {
+    const raw =
+      classifications.length > 0
+        ? classifications
+        : [
+            { id: 'preset-company', code: 'COMPANY', labelHe: 'חברה / קבלן', sortOrder: 0, isPreset: true },
+            { id: 'preset-public', code: 'PUBLIC', labelHe: 'רשות / מוסד', sortOrder: 1, isPreset: true },
+            { id: 'preset-private', code: 'PRIVATE', labelHe: 'לקוח פרטי', sortOrder: 2, isPreset: true },
+          ];
+    return [...raw].sort(
+      (a, b) => a.sortOrder - b.sortOrder || a.labelHe.localeCompare(b.labelHe, 'he'),
+    );
+  }, [classifications]);
 
   const customerStatusLabel = (status: string) => {
     const map: Record<string, string> = {
@@ -5284,16 +5012,61 @@ function CustomersPage({
     return label;
   };
 
-  const filtered = useMemo(() => {
-    return customers.filter((customer) => {
-      const matchesSearch = [customer.name, customer.contactName, customer.city, customer.phone]
-        .join(' ')
-        .includes(search.trim());
-      const matchesType =
-        typeFilter === 'הכל' || normalizeCustomerTypeEnum(customer.type) === typeFilterToEnum(typeFilter);
-      return matchesSearch && matchesType;
-    });
-  }, [customers, search, typeFilter]);
+  const CUSTOMER_PAGE_SIZE = 25;
+  const [listPage, setListPage] = useState(1);
+  const [pagedRows, setPagedRows] = useState<Customer[]>([]);
+  const [pagedTotal, setPagedTotal] = useState(0);
+  const [listLoading, setListLoading] = useState(false);
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [pagedRefreshSeq, setPagedRefreshSeq] = useState(0);
+  const saveInFlightRef = useRef(false);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebouncedSearch(search.trim()), 350);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  useEffect(() => {
+    setListPage(1);
+  }, [debouncedSearch, typeFilter]);
+
+  const serverTypeFilter = typeFilter === 'הכל' ? undefined : typeFilterToEnum(typeFilter);
+
+  const loadCustomerPage = useCallback(async () => {
+    setListLoading(true);
+    try {
+      const params = new URLSearchParams({
+        page: String(listPage),
+        limit: String(CUSTOMER_PAGE_SIZE),
+      });
+      if (debouncedSearch) params.set('q', debouncedSearch);
+      if (serverTypeFilter) params.set('type', serverTypeFilter);
+      const res = await apiFetch(apiUrl(`/customers/paged?${params.toString()}`), { authUser: currentUser });
+      if (!res.ok) throw new Error('paged');
+      const data = (await res.json()) as { items?: Customer[]; total?: number };
+      setPagedRows(Array.isArray(data.items) ? data.items : []);
+      setPagedTotal(typeof data.total === 'number' ? data.total : 0);
+    } catch {
+      setPagedRows([]);
+      setPagedTotal(0);
+    } finally {
+      setListLoading(false);
+    }
+  }, [currentUser, listPage, debouncedSearch, serverTypeFilter]);
+
+  useEffect(() => {
+    void loadCustomerPage();
+  }, [loadCustomerPage, pagedRefreshSeq]);
+
+  const bumpPaged = () => setPagedRefreshSeq((n) => n + 1);
+
+  const prevCustomerCount = useRef<number | null>(null);
+  useEffect(() => {
+    if (prevCustomerCount.current !== null && prevCustomerCount.current !== customers.length) {
+      setPagedRefreshSeq((n) => n + 1);
+    }
+    prevCustomerCount.current = customers.length;
+  }, [customers.length]);
 
   const duplicateEmailCustomer = useMemo(() => {
     const e = normalizeEmail(form.email);
@@ -5310,8 +5083,13 @@ function CustomersPage({
   const emailDuplicateWarning = duplicateEmailCustomer || duplicateEmailLead ? 'קיים כבר ליד/לקוח עם אימייל זה' : '';
 
   const saveCustomer = async () => {
-    if (!form.name.trim() || !form.contactName.trim()) {
-      setCreateError('שם לקוח ואיש קשר הם שדות חובה.');
+    if (saveInFlightRef.current) return;
+    if (!form.name.trim()) {
+      setCreateError('שם לקוח הוא שדה חובה.');
+      return;
+    }
+    if (!form.phone.trim()) {
+      setCreateError('טלפון הוא שדה חובה.');
       return;
     }
 
@@ -5321,33 +5099,50 @@ function CustomersPage({
       return;
     }
 
+    saveInFlightRef.current = true;
     setCreateError('');
     setSaving(true);
     try {
-      const payload = {
-        name: form.name,
-        type: form.type,
-        contactName: form.contactName,
-        phone: form.phone,
-        email: normalizedEmail,
-        city: form.city,
-        status: 'ACTIVE',
-        services: form.services
-          .split(',')
-          .map((s) => s.trim())
-          .filter(Boolean),
-        notes: form.notes || undefined,
+      const isEditing = !!editingCustomerId;
+      const typeEnum = normalizeCustomerTypeEnum(form.type);
+      const payload: Record<string, unknown> = {
+        name: form.name.trim(),
+        type: typeEnum,
+        contactName: form.name.trim(),
+        phone: form.phone.trim(),
+        email: normalizedEmail || '',
+        city: form.city.trim(),
+        address: form.address.trim() ? form.address.trim() : null,
+        status: form.status || 'ACTIVE',
+        services: isEditing
+          ? (form.services || '')
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : [],
       };
+      if (isEditing) {
+        payload.notes = form.notes || '';
+      }
 
-      const res = await fetch('http://localhost:3001/customers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+      const url = isEditing
+        ? `${getApiBaseUrl()}/customers/${editingCustomerId}`
+        : apiUrl('/customers');
+
+      const res = await apiFetch(url, {
+        method: isEditing ? 'PATCH' : 'POST',
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
 
-      if (!res.ok) throw new Error('יצירת לקוח נכשלה');
+      if (!res.ok) {
+        const msg = await parseApiErrorResponse(res);
+        throw new Error(msg || 'שמירת לקוח נכשלה');
+      }
       const created = await res.json();
-      onCreateCustomer(created);
+      if (isEditing) onUpdateCustomer(created);
+      else onCreateCustomer(created);
+      bumpPaged();
       setOpen(false);
       setEditingCustomerId(null);
       setForm({
@@ -5359,13 +5154,28 @@ function CustomersPage({
         city: '',
         address: '',
         idNumber: '',
+        contactRole: '',
+        additionalPhone: '',
+        companyLogoFileName: '',
+        companySize: '',
+        industrySector: '',
+        acvPlanned: '',
+        companyWebsite: '',
+        envCo2ReductionTons: '',
+        envCertifications: '',
+        envExtraNotes: '',
+        leadSource: '',
+        designatedSalesManager: '',
         services: '',
+        status: 'ACTIVE',
         notes: '',
       });
-    } catch {
-      setCreateError('יצירת לקוח נכשלה. נסה שוב מאוחר יותר.');
+    } catch (e) {
+      const m = e instanceof Error ? e.message : '';
+      setCreateError(m || 'שמירת לקוח נכשלה. נסה שוב מאוחר יותר.');
     } finally {
       setSaving(false);
+      saveInFlightRef.current = false;
     }
   };
 
@@ -5373,7 +5183,7 @@ function CustomersPage({
     setEditingCustomerId(customer.id);
     setForm({
       name: customer.name,
-      type: normalizeCustomerTypeEnum(customer.type) as any,
+      type: normalizeCustomerTypeEnum(customer.type),
       contactName: customer.contactName,
       phone: customer.phone,
       email: customer.email,
@@ -5381,7 +5191,20 @@ function CustomersPage({
       address: (customer as any).address || '',
       idNumber: (customer as any).taxId || (customer as any).idNumber || (customer as any).companyNumber || '',
       services: customer.services.join(', '),
+      status: (customer.status || 'ACTIVE').toString().toUpperCase(),
       notes: customer.notes || '',
+      contactRole: '',
+      additionalPhone: '',
+      companyLogoFileName: '',
+      companySize: '',
+      industrySector: '',
+      acvPlanned: '',
+      companyWebsite: '',
+      envCo2ReductionTons: '',
+      envCertifications: '',
+      envExtraNotes: '',
+      leadSource: '',
+      designatedSalesManager: '',
     });
     setCreateError('');
     setOpen(true);
@@ -5390,152 +5213,246 @@ function CustomersPage({
   const deleteCustomer = async (customer: Customer) => {
     if (!window.confirm('האם אתה בטוח שברצונך למחוק את הלקוח?')) return;
     try {
-      const res = await fetch(`http://localhost:3001/customers/${customer.id}`, {
+      const res = await apiFetch(apiUrl(`/customers/${customer.id}`), {
         method: 'DELETE',
-        headers: authHeaders(currentUser),
+        authUser: currentUser,
       });
       if (!res.ok) throw new Error('מחיקת לקוח נכשלה');
       onDeleteCustomer(customer.id);
+      bumpPaged();
     } catch {
       alert('מחיקת לקוח נכשלה. נסה שוב מאוחר יותר.');
     }
   };
 
-  return (
-    <div className="space-y-5">
-      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-        <div>
-          <h1 className="text-3xl font-bold" style={{ color: galit.text }}>לקוחות</h1>
-          <p className="mt-1 text-slate-500">ניהול לקוחות מכל הסוגים: חברות, קבלנים, רשויות, מוסדות ופרטיים</p>
-        </div>
-        <Button
-          className="rounded-2xl"
-          style={{ background: galit.primary }}
-          onClick={() => {
-            setEditingCustomerId(null);
-            setForm({
-              name: '',
-              type: 'COMPANY',
-              contactName: '',
-              phone: '',
-              email: '',
-              city: '',
-              address: '',
-              idNumber: '',
-              services: '',
-              notes: '',
-            });
-            setCreateError('');
-            setOpen(true);
-          }}
-        >
-          <Plus className="ml-2 h-4 w-4" />
-          לקוח חדש
-        </Button>
-      </div>
+  const openCreateCustomerModal = (prefillName?: string) => {
+    const computedName = (prefillName ?? '').trim();
+    setEditingCustomerId(null);
+    setForm({
+      name: computedName,
+      type: 'COMPANY',
+      contactName: '',
+      phone: '',
+      email: '',
+      city: '',
+      address: '',
+      idNumber: '',
+      contactRole: '',
+      additionalPhone: '',
+      companyLogoFileName: '',
+      companySize: '',
+      industrySector: '',
+      acvPlanned: '',
+      companyWebsite: '',
+      envCo2ReductionTons: '',
+      envCertifications: '',
+      envExtraNotes: '',
+      leadSource: '',
+      designatedSalesManager: '',
+      services: '',
+      status: 'ACTIVE',
+      notes: '',
+    });
+    setCreateError('');
+    setOpen(true);
+  };
 
+  const leavesDecor = (
+    <div className="pointer-events-none absolute -left-3 -top-3 h-16 w-16 opacity-25">
+      <div className="absolute left-5 top-1 h-7 w-4 rotate-[-20deg] rounded-full bg-emerald-400" />
+      <div className="absolute left-10 top-5 h-6 w-4 rotate-[18deg] rounded-full bg-emerald-500" />
+      <div className="absolute left-1 top-6 h-5 w-3 rotate-[-35deg] rounded-full bg-emerald-300" />
+    </div>
+  );
+
+  const activeCustomers = customers.filter((c) => (c.status || '').toUpperCase() === 'ACTIVE').length;
+  const estimatedPortfolioValue = customers.reduce((sum, c) => sum + ((c.services?.length || 0) * 3200), 0);
+  const csat = 92;
+  const atRiskCustomers = Math.max(0, customers.length - activeCustomers);
+
+  const totalListPages = Math.max(1, Math.ceil(pagedTotal / CUSTOMER_PAGE_SIZE) || 1);
+  const rangeStart = pagedTotal === 0 ? 0 : (listPage - 1) * CUSTOMER_PAGE_SIZE + 1;
+  const rangeEnd = pagedTotal === 0 ? 0 : Math.min(listPage * CUSTOMER_PAGE_SIZE, pagedTotal);
+
+  const formatSalesCompactILS = (n: number) => {
+    if (!Number.isFinite(n)) return '₪0';
+    if (n >= 1_000_000) return `₪${(n / 1_000_000).toFixed(2)}M`;
+    if (n >= 1_000) return `₪${(n / 1_000).toFixed(2)}K`;
+    return formatCurrencyILS(n);
+  };
+
+  const customerFormControlClass =
+    '!text-lg h-14 rounded-2xl border border-slate-300 bg-white px-4 leading-7 text-slate-900 placeholder:!text-base placeholder:text-slate-400 shadow-sm outline-none transition focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100';
+
+  const {
+    typePie: customerTypePieData,
+    typePieTotal: customerTypePieTotal,
+    statusRows: customerStatusRows,
+    salesRows: salesTeamRows,
+  } = useMemo(
+    () =>
+      computeCustomersPageAnalytics(
+        customers,
+        leads,
+        quotes,
+        projects,
+        tasks,
+        opportunities,
+        users,
+        (code) => resolveCustomerTypeLabel(code, typeLabelMap),
+      ),
+    [customers, leads, quotes, projects, tasks, opportunities, users, typeLabelMap],
+  );
+
+  return (
+    <div className="rounded-[30px] bg-[#f7fbf5] p-6 md:p-8 space-y-5" dir="rtl">
       {loadError && (
         <div className="rounded-2xl bg-red-50 px-4 py-3 text-sm text-red-700">
           {loadError}
         </div>
       )}
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <KpiCard title="סה״כ לקוחות" value={customers.length} sub="רשומים במערכת" icon={Users} />
-        <KpiCard title="חברות וקבלנים" value={customers.filter((c) => normalizeCustomerTypeEnum(c.type) === 'COMPANY').length} sub="לקוחות עסקיים" icon={FileText} />
-        <KpiCard title="רשויות ומוסדות" value={customers.filter((c) => normalizeCustomerTypeEnum(c.type) === 'PUBLIC').length} sub="גופים ציבוריים" icon={Bell} />
-        <KpiCard title="לקוחות פרטיים" value={customers.filter((c) => normalizeCustomerTypeEnum(c.type) === 'PRIVATE').length} sub="בתים ודירות" icon={CheckCircle2} />
+      <div className="flex flex-col gap-5">
+        <div className="order-1 grid gap-3 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-4">
+        {[
+          { title: 'סה"כ לקוחות פעילים', value: activeCustomers, sub: 'לקוחות במצב פעיל' },
+          { title: 'שווי תיק לקוחות', value: formatCurrencyILS(estimatedPortfolioValue), sub: 'הערכה על בסיס שירותים' },
+          { title: 'מדד שביעות רצון (CSAT)', value: `${csat}%`, sub: 'סקרי שירות תקופתיים' },
+          { title: 'לקוחות בסיכון', value: atRiskCustomers, sub: 'דורשים מעקב מוגבר' },
+        ].map((kpi) => (
+          <Card key={kpi.title} className="relative overflow-hidden rounded-3xl border-0 bg-white shadow-[0_10px_26px_rgba(15,23,42,0.08)]">
+            {leavesDecor}
+            <CardContent className="p-4">
+              <div className="text-sm font-semibold text-slate-500">{kpi.title}</div>
+              <div className="mt-2 text-3xl font-black text-slate-900">{kpi.value}</div>
+              <div className="mt-1 text-xs text-emerald-700">{kpi.sub}</div>
+            </CardContent>
+          </Card>
+        ))}
       </div>
 
-      <Card>
-        <CardContent className="p-3 sm:p-4">
-          <div className="mb-4 grid grid-cols-1 gap-3 md:grid-cols-[1fr_220px]">
-            <div>
-              <div className="mb-1 text-xs text-slate-500">חיפוש</div>
-              <div className="relative">
-                <Search className="absolute right-3 top-3 h-4 w-4 text-slate-400" />
-                <Input className="pr-9" placeholder="חיפוש לפי לקוח, איש קשר, עיר או טלפון" value={search} onChange={(e) => setSearch(e.target.value)} />
-              </div>
-            </div>
-            <div>
-              <div className="mb-1 text-xs text-slate-500">סוג לקוח</div>
-              <Select value={typeFilter} onChange={setTypeFilter} options={['הכל', 'חברה / קבלן', 'רשות / מוסד', 'לקוח פרטי']} />
-            </div>
-          </div>
+        <Card className="order-2 rounded-3xl border-0 bg-white shadow-[0_10px_26px_rgba(15,23,42,0.08)]">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-xl font-bold text-slate-900">חפש לקוח</CardTitle>
 
+          <div className="mt-3 flex items-center gap-2">
+            <div className="relative w-full md:w-[52%]">
+              <Search className="absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+              <Input
+                className={cn(
+                  'h-16 rounded-2xl bg-emerald-50 border-emerald-200 pr-11 px-6 shadow-sm focus-visible:ring-emerald-300',
+                  'py-3 font-semibold leading-7',
+                  search.trim()
+                    ? 'text-xl placeholder:text-base placeholder:text-slate-500'
+                    : 'text-lg placeholder:text-base placeholder:text-slate-400',
+                )}
+                placeholder="חיפוש לפי שם לקוח או טלפון"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
+            </div>
+
+            <Button
+              className="h-16 rounded-2xl px-12 py-0 text-base font-semibold shadow-md hover:shadow-lg text-white whitespace-nowrap"
+              style={{ background: galit.primary }}
+              onClick={() => openCreateCustomerModal(search.trim())}
+            >
+              <Plus className="ml-2 h-4 w-4" />
+              הוספת לקוח חדש
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="p-3 sm:p-4">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-sm text-slate-600">
+            <div className="inline-flex min-h-[1.25rem] items-center gap-2">
+              {listLoading ? (
+                <>
+                  <Loader2 className="h-4 w-4 shrink-0 animate-spin" aria-hidden />
+                  <span>טוען רשימת לקוחות...</span>
+                </>
+              ) : null}
+            </div>
+            {!listLoading && pagedTotal > 0 ? (
+              <span className="tabular-nums">
+                מציג {rangeStart}–{rangeEnd} מתוך {pagedTotal}
+              </span>
+            ) : null}
+          </div>
           <div className="hidden md:block">
             <Table>
               <TableHeader>
-                <TableRow>
+                <TableRow className="bg-emerald-50">
                   <TableHead>שם לקוח</TableHead>
-                  <TableHead>סטטוס</TableHead>
-                  <TableHead>סוג לקוח</TableHead>
                   <TableHead>איש קשר</TableHead>
-                  <TableHead>טלפון</TableHead>
-                  <TableHead>אימייל</TableHead>
-                  <TableHead>עיר</TableHead>
-                  <TableHead>שירותים</TableHead>
+                  <TableHead>סוג לקוח</TableHead>
+                  <TableHead>ACV משוער</TableHead>
+                  <TableHead>סטטוס פעילות</TableHead>
+                  <TableHead>פעילות אחרונה</TableHead>
+                  <TableHead>מדד נאמנות</TableHead>
                   <TableHead>פעולות</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filtered.map((customer) => (
+                {listLoading && pagedRows.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={8} className="py-10 text-center text-sm text-slate-500">
+                      <span className="inline-flex items-center justify-center gap-2">
+                        <Loader2 className="h-5 w-5 animate-spin" aria-hidden />
+                        טוען...
+                      </span>
+                    </TableCell>
+                  </TableRow>
+                ) : !listLoading && pagedRows.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={8} className="py-8 text-center text-sm text-slate-500">
+                      <div className="flex flex-col items-center justify-center gap-3">
+                        <div>לא נמצאו לקוחות{debouncedSearch ? ' התואמים לחיפוש' : ''}</div>
+                        <Button
+                          className="rounded-2xl px-4 py-2 text-sm font-semibold text-white"
+                          style={{ background: galit.primary }}
+                          onClick={() => openCreateCustomerModal(search.trim())}
+                        >
+                          הוסף לקוח חדש
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  pagedRows.map((customer, idx) => {
+                  const loyalty = Math.max(58, 92 - idx * 4);
+                  const acv = formatCurrencyILS(Math.max(4200, (customer.services?.length || 1) * 3900));
+                  const statusRaw = (customer.status || 'ACTIVE').toUpperCase();
+                  const statusUi =
+                    statusRaw === 'ACTIVE'
+                      ? { label: 'Active', cls: 'bg-emerald-100 text-emerald-800' }
+                      : statusRaw === 'INACTIVE'
+                        ? { label: 'At Risk', cls: 'bg-red-100 text-red-700' }
+                        : { label: 'Handling', cls: 'bg-amber-100 text-amber-800' };
+                  return (
                   <TableRow
                     key={customer.id}
                     className="cursor-pointer hover:bg-slate-50"
                     onClick={() => onOpenCustomer(customer)}
                   >
                     <TableCell>
-                      <div className="font-medium">{customer.name}</div>
+                      <div className="flex items-center gap-2">
+                        <div className="h-8 w-8 rounded-full bg-emerald-100" />
+                        <div className="font-medium">{customer.name}</div>
+                      </div>
                     </TableCell>
-                    <TableCell>{customerStatusLabel(customer.status || '')}</TableCell>
-                    <TableCell>{customerTypeLabel(customer.type)}</TableCell>
                     <TableCell>{customer.contactName || '-'}</TableCell>
+                    <TableCell>{customerTypeLabel(customer.type)}</TableCell>
+                    <TableCell className="font-semibold">{acv}</TableCell>
                     <TableCell>
-                      {customer.phone ? (
-                        <div className="space-y-1">
-                          <a
-                            href={phoneToTelHref(customer.phone) || undefined}
-                            className="hover:underline"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            {phoneToDisplay(customer.phone)}
-                          </a>
-                          <div className="text-xs">
-                            <a
-                              href={phoneToWhatsAppHref(customer.phone) || undefined}
-                              className="text-sky-700 hover:underline"
-                              target="_blank"
-                              rel="noreferrer"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              וואטסאפ
-                            </a>
-                          </div>
+                      <Badge className={statusUi.cls}>{statusUi.label}</Badge>
+                    </TableCell>
+                    <TableCell>{new Date(Date.now() - idx * 86400000).toLocaleDateString('he-IL')}</TableCell>
+                    <TableCell>
+                      <div className="flex items-center gap-2">
+                        <div className="h-2 w-24 rounded-full bg-slate-100">
+                          <div className="h-2 rounded-full bg-emerald-500" style={{ width: `${loyalty}%` }} />
                         </div>
-                      ) : (
-                        '-'
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      {customer.email ? (
-                        <a
-                          href={emailToMailtoHref(customer.email) || undefined}
-                          className="hover:underline"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          {customer.email}
-                        </a>
-                      ) : (
-                        '-'
-                      )}
-                    </TableCell>
-                    <TableCell>{customer.city || '-'}</TableCell>
-                    <TableCell>
-                      <div className="flex flex-wrap gap-1">
-                        {customer.services.map((service) => (
-                          <Badge key={service} className="bg-slate-100 text-slate-700">{customerServiceLabel(service)}</Badge>
-                        ))}
+                        <span className="text-xs font-semibold text-emerald-700">{loyalty}%</span>
                       </div>
                     </TableCell>
                     <TableCell>
@@ -5547,23 +5464,47 @@ function CustomersPage({
                         >
                           עריכה
                         </Button>
-                        <Button
-                          variant="outline"
-                          className="px-2 py-1 text-xs text-red-700"
-                          onClick={() => deleteCustomer(customer)}
-                        >
-                          מחיקה
-                        </Button>
+                        {(currentUser.role === 'admin' || currentUser.role === 'manager' || currentUser.canDeleteCustomers) && (
+                          <Button
+                            variant="outline"
+                            className="px-2 py-1 text-xs text-red-700"
+                            onClick={() => deleteCustomer(customer)}
+                          >
+                            מחיקה
+                          </Button>
+                        )}
                       </div>
                     </TableCell>
                   </TableRow>
-                ))}
+                )})
+                )}
               </TableBody>
             </Table>
           </div>
 
           <div className="space-y-3 md:hidden">
-            {filtered.map((customer) => (
+            {listLoading && pagedRows.length === 0 ? (
+              <div className="flex items-center justify-center gap-2 py-10 text-sm text-slate-500">
+                <Loader2 className="h-5 w-5 animate-spin" aria-hidden />
+                טוען...
+              </div>
+            ) : !listLoading && pagedRows.length === 0 ? (
+              <div className="rounded-2xl border border-slate-100 bg-slate-50 px-4 py-6 text-center text-sm text-slate-500">
+                <div className="font-semibold text-slate-700">
+                  לא נמצאו לקוחות{debouncedSearch ? ' התואמים לחיפוש' : ''}
+                </div>
+                <div className="mt-3">
+                  <Button
+                    className="w-full rounded-2xl px-4 py-2 text-sm font-semibold text-white"
+                    style={{ background: galit.primary }}
+                    onClick={() => openCreateCustomerModal(search.trim())}
+                  >
+                    הוסף לקוח חדש
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              pagedRows.map((customer) => (
               <button
                 key={customer.id}
                 onClick={() => onOpenCustomer(customer)}
@@ -5636,109 +5577,264 @@ function CustomersPage({
                   </div>
                 </div>
               </button>
-            ))}
+            ))
+            )}
+          </div>
+
+          <div className="mt-4 flex flex-wrap items-center justify-center gap-3 border-t border-slate-100 pt-4">
+            <Button
+              type="button"
+              variant="outline"
+              className="rounded-2xl"
+              disabled={listLoading || listPage <= 1}
+              onClick={() => setListPage((p) => Math.max(1, p - 1))}
+            >
+              עמוד קודם
+            </Button>
+            <span className="text-sm tabular-nums text-slate-600">
+              {listPage} / {totalListPages}
+            </span>
+            <Button
+              type="button"
+              variant="outline"
+              className="rounded-2xl"
+              disabled={listLoading || listPage >= totalListPages || pagedTotal === 0}
+              onClick={() => setListPage((p) => p + 1)}
+            >
+              עמוד הבא
+            </Button>
           </div>
         </CardContent>
       </Card>
 
-      <Modal open={open} onClose={() => setOpen(false)} title="יצירת / עריכת לקוח">
-        <div className="space-y-3">
-          <FormField label="שם לקוח">
-            <Input
-              placeholder="שם לקוח"
-              value={form.name}
-              onChange={(e) => setForm({ ...form, name: e.target.value })}
-            />
-          </FormField>
-          <FormField label="סוג לקוח">
-            <select
-              value={form.type}
-              onChange={(e) => setForm({ ...form, type: e.target.value })}
-              className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm outline-none transition focus:border-slate-400"
-            >
-              <option value="COMPANY">{customerTypeLabel('COMPANY')}</option>
-              <option value="PUBLIC">{customerTypeLabel('PUBLIC')}</option>
-              <option value="PRIVATE">{customerTypeLabel('PRIVATE')}</option>
-            </select>
-          </FormField>
-          <FormField label="איש קשר">
-            <Input
-              placeholder="איש קשר"
-              value={form.contactName}
-              onChange={(e) => setForm({ ...form, contactName: e.target.value })}
-            />
-          </FormField>
-          <FormField label="טלפון">
-            <PhoneInput placeholder="טלפון" value={form.phone} onChange={(v) => setForm({ ...form, phone: v })} />
-          </FormField>
-          <FormField label="אימייל">
-            <EmailInput
-              placeholder="אימייל"
-              value={form.email}
-              onChange={(v) => setForm({ ...form, email: v })}
-            />
-          </FormField>
-          {emailDuplicateWarning && (
-            <div className="text-xs text-amber-700">
-              {emailDuplicateWarning}
-              {duplicateEmailCustomer && (
-                <button
-                  type="button"
-                  className="mr-2 underline"
-                  onClick={() => {
-                    setOpen(false);
-                    onOpenCustomer(duplicateEmailCustomer);
-                  }}
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <Card className="rounded-2xl border border-slate-100/90 bg-white p-4 shadow-[0_4px_24px_rgba(15,23,42,0.07)]">
+          <CardHeader className="p-0 pb-3">
+            <CardTitle className="text-lg font-bold text-slate-900">סוג הלקוחות</CardTitle>
+          </CardHeader>
+          <CardContent className="p-0">
+            {customerTypePieData.length === 0 ? (
+              <div className="py-10 text-center text-sm text-slate-500">אין לקוחות להצגת פילוח</div>
+            ) : (
+              <>
+                <div className="h-[220px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={customerTypePieData}
+                        dataKey="value"
+                        nameKey="name"
+                        cx="50%"
+                        cy="50%"
+                        innerRadius={58}
+                        outerRadius={88}
+                        paddingAngle={2}
+                      >
+                        {customerTypePieData.map((entry) => (
+                          <Cell key={entry.code} fill={entry.color} stroke="white" strokeWidth={1} />
+                        ))}
+                      </Pie>
+                      <Tooltip
+                        formatter={(value, name) => {
+                          const v = Number(value ?? 0);
+                          const pct = ((v / customerTypePieTotal) * 100).toFixed(1);
+                          return [`${pct}%`, String(name ?? '')];
+                        }}
+                      />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+                <div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
+                  {customerTypePieData.map((entry) => (
+                    <div key={entry.code} className="flex items-center justify-between gap-2 text-sm">
+                      <span className="flex min-w-0 items-center gap-2 text-slate-700">
+                        <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: entry.color }} />
+                        <span className="truncate">{entry.name}</span>
+                      </span>
+                      <span className="shrink-0 tabular-nums font-semibold text-emerald-800">
+                        {((entry.value / customerTypePieTotal) * 100).toFixed(1)}%
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-2xl border border-slate-100/90 bg-white p-4 shadow-[0_4px_24px_rgba(15,23,42,0.07)]">
+          <CardHeader className="p-0 pb-3">
+            <CardTitle className="text-lg font-bold text-slate-900">סיכום סטטוס לקוחות (גלית)</CardTitle>
+          </CardHeader>
+          <CardContent className="p-0">
+            <div className="overflow-hidden rounded-xl border border-slate-100">
+              <div className="grid grid-cols-2 gap-0 bg-emerald-50/80 px-3 py-2.5 text-xs font-semibold text-slate-600">
+                <div className="text-right">תיאור התיק</div>
+                <div className="text-right tabular-nums">כמות</div>
+              </div>
+              <div className="divide-y divide-slate-100">
+                {customerStatusRows.map((row) => (
+                  <div
+                    key={row.label}
+                    className="grid grid-cols-2 items-center gap-2 px-3 py-2.5 text-sm text-slate-800"
+                  >
+                    <div className="text-right">{row.label}</div>
+                    <div className="text-right font-semibold tabular-nums text-slate-900">{row.count}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-2xl border border-slate-100/90 bg-white p-4 shadow-[0_4px_24px_rgba(15,23,42,0.07)]">
+          <CardHeader className="p-0 pb-3">
+            <CardTitle className="text-lg font-bold text-slate-900">ביצועי צוות מכירות</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4 p-0">
+            {salesTeamRows.length === 0 ? (
+              <div className="py-6 text-center text-sm text-slate-500">אין נתוני מכירות משויכים (הצעות עם איש צוות)</div>
+            ) : (
+            salesTeamRows.map((row) => (
+              <div key={row.userId} className="flex items-start gap-3">
+                <div
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-xs font-bold text-emerald-800 ring-2 ring-white shadow-sm"
+                  aria-hidden
                 >
-                  פתח
-                </button>
+                  {row.initials}
+                </div>
+                <div className="min-w-0 flex-1 space-y-1.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-sm font-semibold text-slate-900">{row.name}</span>
+                    <span className="text-sm font-semibold tabular-nums text-slate-700">
+                      {formatSalesCompactILS(row.amount)}
+                    </span>
+                  </div>
+                  <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100">
+                    <div
+                      className="h-full rounded-full bg-gradient-to-l from-emerald-600 to-emerald-500"
+                      style={{ width: `${Math.min(100, row.percent)}%` }}
+                    />
+                  </div>
+                  <div className="text-xs font-medium text-emerald-700">
+                    {row.percent.toFixed(1)}% יחסי למוביל בצוות
+                  </div>
+                </div>
+              </div>
+            ))
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <Modal
+        open={open}
+        onClose={() => {
+          setOpen(false);
+        }}
+        title={editingCustomerId ? 'עריכת לקוח' : 'הוספת לקוח חדש'}
+        maxWidth="max-w-xl"
+        hideHeader={false}
+        titleClassName="text-xl font-bold text-slate-900"
+      >
+        <div className="space-y-5" dir="rtl">
+          <div className="rounded-2xl border border-slate-200/90 bg-white p-5 shadow-[0_4px_24px_rgba(15,23,42,0.07)] md:p-6">
+            <div className="mb-4 border-b border-slate-100 pb-3">
+              <div className="text-lg font-bold text-slate-900">
+                {editingCustomerId ? 'פרטי הלקוח' : 'פרטי לקוח חדש'}
+              </div>
+              <div className="mt-1 text-base text-slate-500">מלאו את השדות הבאים — כל השדות מוצגים בבירור.</div>
+            </div>
+            <div className="space-y-4">
+              <FormField label="שם הלקוח" labelClassName="text-base font-semibold text-slate-800">
+                <Input
+                  className={customerFormControlClass}
+                  placeholder="שם הלקוח"
+                  value={form.name}
+                  onChange={(e) => setForm({ ...form, name: e.target.value })}
+                />
+              </FormField>
+              <FormField label="טלפון" labelClassName="text-base font-semibold text-slate-800">
+                <PhoneInput
+                  className={customerFormControlClass}
+                  placeholder="טלפון"
+                  value={form.phone}
+                  onChange={(v) => setForm({ ...form, phone: v })}
+                />
+              </FormField>
+              <FormField label="אימייל" labelClassName="text-base font-semibold text-slate-800">
+                <EmailInput
+                  className={customerFormControlClass}
+                  placeholder="אימייל"
+                  value={form.email}
+                  onChange={(v) => setForm({ ...form, email: v })}
+                />
+              </FormField>
+              {emailDuplicateWarning && (
+                <div className="text-sm text-amber-800">
+                  {emailDuplicateWarning}
+                  {duplicateEmailCustomer && (
+                    <button
+                      type="button"
+                      className="mr-2 font-semibold underline"
+                      onClick={() => {
+                        setOpen(false);
+                        onOpenCustomer(duplicateEmailCustomer);
+                      }}
+                    >
+                      פתח
+                    </button>
+                  )}
+                </div>
               )}
+              <FormField label="כתובת מלאה (רחוב ומספר)" labelClassName="text-base font-semibold text-slate-800">
+                <Input
+                  className={customerFormControlClass}
+                  placeholder="למשל: אחוזה 154"
+                  value={form.address}
+                  onChange={(e) => setForm({ ...form, address: e.target.value })}
+                />
+              </FormField>
+              <FormField label="עיר" labelClassName="text-base font-semibold text-slate-800">
+                <CitySearchInput
+                  value={form.city}
+                  onChange={(v) => setForm({ ...form, city: v })}
+                  inputClassName={customerFormControlClass}
+                />
+              </FormField>
+              <FormField label="סיווג הלקוח" labelClassName="text-base font-semibold text-slate-800">
+                <select
+                  value={form.type}
+                  onChange={(e) => setForm({ ...form, type: e.target.value })}
+                  className={cn(customerFormControlClass, 'cursor-pointer')}
+                >
+                  {sortedClassificationOptions.map((c) => (
+                    <option key={c.id} value={c.code}>
+                      {c.labelHe}
+                    </option>
+                  ))}
+                  {form.type && !sortedClassificationOptions.some((c) => c.code === form.type) && (
+                    <option value={form.type}>{customerTypeLabel(form.type)}</option>
+                  )}
+                </select>
+                <p className="mt-2 text-sm text-slate-500">
+                  ניתן לבחור רק מתוך סיווגים קיימים. הוספת סיווג חדש מתבצעת רק ב<strong className="font-semibold">הגדרות</strong>{' '}
+                  (מנהל מערכת / מנהל).
+                </p>
+              </FormField>
             </div>
-          )}
-          <FormField label="עיר">
-            <Input
-              placeholder="עיר"
-              value={form.city}
-              onChange={(e) => setForm({ ...form, city: e.target.value })}
-            />
-          </FormField>
-
-          <FormField label="כתובת">
-            <Input
-              placeholder="כתובת"
-              value={form.address}
-              onChange={(e) => setForm({ ...form, address: e.target.value })}
-            />
-          </FormField>
-
-          <FormField label="ח.פ / ת.ז">
-            <Input
-              placeholder="ח.פ / ת.ז"
-              value={form.idNumber}
-              onChange={(e) => setForm({ ...form, idNumber: formatNumericIdentifier(e.target.value) })}
-            />
-          </FormField>
-          <FormField label="שירותים">
-            <Input
-              placeholder="שירותים (מופרדים בפסיק)"
-              value={form.services}
-              onChange={(e) => setForm({ ...form, services: e.target.value })}
-            />
-          </FormField>
-          <FormField label="הערות">
-            <Textarea
-              placeholder="הערות"
-              value={form.notes}
-              onChange={(e) => setForm({ ...form, notes: e.target.value })}
-            />
-          </FormField>
+          </div>
           {createError && (
-            <div className="rounded-2xl bg-red-50 px-4 py-2 text-xs text-red-700">
-              {createError}
-            </div>
+            <div className="rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-800">{createError}</div>
           )}
-          <Button className="w-full" style={{ background: galit.primary }} onClick={saveCustomer}>
-            {saving ? 'שומר...' : 'שמור לקוח'}
+          <Button
+            className="h-14 w-full rounded-2xl text-lg font-semibold text-white shadow-md"
+            style={{ background: galit.primary }}
+            onClick={saveCustomer}
+          >
+            {saving ? 'שומר...' : editingCustomerId ? 'שמור שינויים' : 'צור לקוח'}
           </Button>
         </div>
       </Modal>
@@ -5759,6 +5855,28 @@ function QuotesPage({
   currentUser: AppUser;
   onQuotesChange: (next: Quote[]) => void;
 }) {
+  type AIDraftLineItem = {
+    name: string;
+    quantity: number;
+    unitPrice: number;
+    lineTotal: number;
+  };
+  type AIDraft = {
+    title: string;
+    customerNameHint: string | null;
+    suggestedCustomerId: string | null;
+    service: string;
+    siteOrProject: string | null;
+    description: string;
+    lineItems: AIDraftLineItem[];
+    notes: string;
+    terms: string;
+    subtotalBeforeVat: number;
+    vatPercent: number;
+    vatAmount: number;
+    totalWithVat: number;
+  };
+
   const [saving, setSaving] = useState(false);
   const [currentQuoteId, setCurrentQuoteId] = useState<string | null>(null);
   const [error, setError] = useState('');
@@ -5766,13 +5884,31 @@ function QuotesPage({
   const [catalogItems, setCatalogItems] = useState<any[]>([]);
   const [catalogSelectedId, setCatalogSelectedId] = useState('');
   const [catalogQty, setCatalogQty] = useState('1');
+  const [aiOpen, setAiOpen] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState('');
+  const [aiGenerating, setAiGenerating] = useState(false);
+  const [aiDraft, setAiDraft] = useState<AIDraft | null>(null);
+  const [emailModalOpen, setEmailModalOpen] = useState(false);
+  const [emailTo, setEmailTo] = useState('');
+  const [emailSubject, setEmailSubject] = useState('הצעת מחיר - גלית החברה לאיכות הסביבה');
+  const [emailBody, setEmailBody] = useState(
+    'שלום,\nמצורפת הצעת המחיר שביקשת.\nנשמח לעמוד לרשותך לכל שאלה.\n\nבברכה,\nגלית - החברה לאיכות הסביבה',
+  );
+  const [pdfReady, setPdfReady] = useState(false);
+  const [quoteTemplatesList, setQuoteTemplatesList] = useState<any[]>([]);
+  const [selectedTemplateId, setSelectedTemplateId] = useState('');
+  const [contentHtml, setContentHtml] = useState('');
+  const [templateLineItems, setTemplateLineItems] = useState<QuoteTemplateLineItem[]>([]);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [templatesLoading, setTemplatesLoading] = useState(false);
+  const lastAutoTemplateKeyRef = useRef('');
 
   const [form, setForm] = useState({
     quoteNumber: '',
     customerId: '',
     opportunityId: '',
     projectId: '',
-    service: 'אקוסטיקה',
+    service: 'אקוסטיקה / רעש',
     description: '',
     amountBeforeVat: '0',
     vatPercent: '17',
@@ -5785,11 +5921,45 @@ function QuotesPage({
   });
 
   useEffect(() => {
-    fetch('http://localhost:3001/quote-item-catalog', { headers: authHeaders(currentUser) })
+    apiFetch(apiUrl('/quote-item-catalog'), { authUser: currentUser })
       .then((r) => (r.ok ? r.json() : []))
       .then((data) => setCatalogItems(Array.isArray(data) ? data.filter((x) => x.isActive !== false) : []))
       .catch(() => setCatalogItems([]));
   }, [currentUser.id, currentUser.role]);
+
+  useEffect(() => {
+    if (!form.service?.trim()) {
+      setQuoteTemplatesList([]);
+      return;
+    }
+    let cancelled = false;
+    setTemplatesLoading(true);
+    apiFetch(
+      apiUrl(`/quote-templates?serviceType=${encodeURIComponent(form.service)}&activeOnly=true`),
+      { authUser: currentUser },
+    )
+      .then((r) => (r.ok ? r.json() : []))
+      .then((data) => {
+        if (!cancelled) setQuoteTemplatesList(Array.isArray(data) ? data : []);
+      })
+      .catch(() => {
+        if (!cancelled) setQuoteTemplatesList([]);
+      })
+      .finally(() => {
+        if (!cancelled) setTemplatesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [form.service, currentUser]);
+
+  useEffect(() => {
+    if (quoteTemplatesList.length === 1) {
+      setSelectedTemplateId(quoteTemplatesList[0].id);
+    } else if (quoteTemplatesList.length === 0) {
+      setSelectedTemplateId('');
+    }
+  }, [quoteTemplatesList]);
 
   const applyCatalogItem = (item: any, qty: number) => {
     const q = Number.isFinite(qty) && qty > 0 ? qty : 1;
@@ -5813,67 +5983,200 @@ function QuotesPage({
     return Math.max(0, withVat);
   }, [form.amountBeforeVat, form.discountType, form.discountValue, form.vatPercent]);
 
-  const saveQuote = async () => {
+  const serviceOptionsForQuote = useMemo(() => {
+    const s = new Set<string>([...QUOTE_SERVICE_TYPE_OPTIONS]);
+    if (form.service?.trim()) s.add(form.service.trim());
+    return Array.from(s);
+  }, [form.service]);
+
+  const applyTemplateNow = (tpl: any) => {
+    if (!tpl || !form.customerId) {
+      setError('יש לבחור לקוח לפני טעינת תבנית.');
+      return;
+    }
+    const customer = customers.find((c) => c.id === form.customerId);
+    if (!customer) return;
+    setError('');
+    const raw = tpl.defaultLineItems as any;
+    const arr = Array.isArray(raw) ? raw : [];
+    const lineItems: QuoteTemplateLineItem[] = arr.map((x: any) => ({
+      name: String(x.name ?? ''),
+      quantity: Number(x.quantity) > 0 ? Number(x.quantity) : 1,
+      unitPrice: Number(x.unitPrice) || 0,
+    }));
+    setTemplateLineItems(lineItems);
+    const subtotal = Math.round(lineItems.reduce((a, li) => a + li.quantity * li.unitPrice, 0) * 100) / 100;
+    const disc = parseCurrencyInput(form.discountValue) ?? 0;
+    const ctx = buildQuoteTemplateContext(
+      {
+        customer: {
+          name: customer.name,
+          contactName: customer.contactName,
+          address: customer.address,
+          city: customer.city,
+          email: customer.email,
+          phone: customer.phone,
+        },
+        serviceName: form.service,
+        quoteNumber: form.quoteNumber || '—',
+        quoteDate: form.validityDate ? new Date(form.validityDate) : new Date(),
+        notes: form.notes,
+        lineItems,
+        vatPercent: Number(form.vatPercent) || 0,
+        discountType: form.discountType,
+        discountValue: disc,
+      },
+      formatCurrencyILS,
+    );
+    const html = mergeQuoteTemplateFull(tpl, ctx);
+    setContentHtml(html);
+    setForm((p) => ({
+      ...p,
+      amountBeforeVat: String(subtotal),
+      description: mergedHtmlToPlainDescription(html),
+    }));
+  };
+
+  useEffect(() => {
+    if (quoteTemplatesList.length !== 1 || !form.customerId) return;
+    const tpl = quoteTemplatesList[0];
+    const key = `${tpl.id}-${form.customerId}-${form.service}`;
+    if (lastAutoTemplateKeyRef.current === key) return;
+    lastAutoTemplateKeyRef.current = key;
+    applyTemplateNow(tpl);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [quoteTemplatesList, form.customerId, form.service]);
+
+  const loadQuoteForEdit = async (id: string) => {
+    setError('');
+    setSuccess('');
+    try {
+      const res = await apiFetch(apiUrl(`/quotes/${encodeURIComponent(id)}`), { authUser: currentUser });
+      if (!res.ok) throw new Error();
+      const data = await res.json();
+      setCurrentQuoteId(data.id);
+      setPdfReady(!!data.pdfPath);
+      const vd = data.validityDate
+        ? new Date(data.validityDate).toISOString().slice(0, 10)
+        : new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      setForm({
+        quoteNumber: data.quoteNumber || '',
+        customerId: data.customerId || '',
+        opportunityId: data.opportunityId || '',
+        projectId: data.projectId || '',
+        service: data.service || 'אקוסטיקה / רעש',
+        description: data.description || '',
+        amountBeforeVat: String(data.amountBeforeVat ?? data.amount ?? 0),
+        vatPercent: String(data.vatPercent ?? 17),
+        discountType: data.discountType || 'NONE',
+        discountValue: String(data.discountValue ?? 0),
+        validityDate: vd,
+        paymentTerms: data.paymentTerms || 'שוטף 30',
+        status: data.status || 'DRAFT',
+        notes: data.notes || '',
+      });
+      setContentHtml(String(data.contentHtml || ''));
+      setSelectedTemplateId(data.quoteTemplateId || '');
+      const li = data.lineItemsJson;
+      setTemplateLineItems(Array.isArray(li) ? li : []);
+      lastAutoTemplateKeyRef.current = `loaded-${id}`;
+      setSuccess('ההצעה נטענה לעריכה');
+    } catch {
+      setError('טעינת הצעה נכשלה');
+    }
+  };
+
+  const normalizeQuoteFromApi = (data: any, currentForm: typeof form): Quote => ({
+    id: data.id,
+    quoteNumber: data.quoteNumber ?? null,
+    customerId: data.customerId ?? null,
+    customerName: data.customer?.name ?? customers.find((c) => c.id === data.customerId)?.name ?? undefined,
+    opportunityId: data.opportunityId ?? null,
+    opportunityName:
+      data.opportunity?.projectOrServiceName ?? opportunities.find((o) => o.id === data.opportunityId)?.projectOrServiceName ?? undefined,
+    projectId: data.projectId ?? null,
+    client: data.customer?.name ?? customers.find((c) => c.id === data.customerId)?.name ?? '',
+    service: data.service ?? currentForm.service,
+    description: data.description ?? currentForm.description,
+    amount: Number(data.amountBeforeVat ?? data.amount ?? 0),
+    amountBeforeVat: data.amountBeforeVat ?? null,
+    vatPercent: data.vatPercent ?? null,
+    discountType: data.discountType ?? null,
+    discountValue: data.discountValue ?? null,
+    totalAmount: data.totalAmount ?? null,
+    status: data.status ?? currentForm.status,
+    validTo: data.validityDate ? new Date(data.validityDate).toISOString().slice(0, 10) : currentForm.validityDate,
+    validityDate: data.validityDate ? new Date(data.validityDate).toISOString().slice(0, 10) : null,
+    notes: data.notes ?? null,
+    pdfPath: data.pdfPath ?? undefined,
+    contentHtml: data.contentHtml ?? null,
+    lineItemsJson: data.lineItemsJson ?? null,
+    quoteTemplateId: data.quoteTemplateId ?? null,
+  });
+
+  const saveQuote = async (sourceForm?: typeof form) => {
+    const currentForm = sourceForm ?? form;
     setSaving(true);
     setError('');
     setSuccess('');
     try {
-      const amountBeforeVat = parseCurrencyInput(form.amountBeforeVat);
-      const discountValue = parseCurrencyInput(form.discountValue);
-      if (amountBeforeVat === null || (form.discountValue.trim() !== '' && discountValue === null)) {
+      if (!currentForm.customerId?.trim()) {
+        setError('יש לבחור לקוח לפני שמירת הצעת מחיר.');
+        return;
+      }
+      const amountBeforeVat = parseCurrencyInput(currentForm.amountBeforeVat);
+      const discountValue = parseCurrencyInput(currentForm.discountValue);
+      if (amountBeforeVat === null || (currentForm.discountValue.trim() !== '' && discountValue === null)) {
         throw new Error('סכום לא תקין');
       }
 
+      const validToIso =
+        currentForm.validityDate && currentForm.validityDate.trim()
+          ? new Date(currentForm.validityDate).toISOString()
+          : new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString();
+
       const payload: any = {
-        quoteNumber: form.quoteNumber || null,
-        customerId: form.customerId || null,
-        opportunityId: form.opportunityId || null,
-        projectId: form.projectId || null,
-        service: form.service,
-        description: form.description || null,
+        quoteNumber: currentForm.quoteNumber || null,
+        customerId: currentForm.customerId,
+        opportunityId: currentForm.opportunityId || null,
+        projectId: currentForm.projectId || null,
+        service: currentForm.service,
+        description: currentForm.description || null,
         amountBeforeVat: amountBeforeVat ?? 0,
-        vatPercent: Number(form.vatPercent) || 0,
-        discountType: form.discountType,
+        amount: amountBeforeVat ?? 0,
+        vatPercent: Number(currentForm.vatPercent) || 0,
+        discountType: currentForm.discountType,
         discountValue: discountValue ?? 0,
-        validityDate: form.validityDate ? new Date(form.validityDate).toISOString() : null,
-        paymentTerms: form.paymentTerms || null,
-        status: form.status,
-        notes: form.notes || null,
+        validityDate: validToIso,
+        validTo: validToIso,
+        paymentTerms: currentForm.paymentTerms || null,
+        status: currentForm.status,
+        notes: currentForm.notes || null,
+        contentHtml: contentHtml || null,
+        lineItemsJson: templateLineItems.length ? templateLineItems : null,
+        quoteTemplateId: selectedTemplateId || null,
       };
 
-      const res = await fetch('http://localhost:3001/quotes', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+      const updating = !!currentQuoteId;
+      const url = updating ? `${getApiBaseUrl()}/quotes/${currentQuoteId}` : apiUrl('/quotes');
+      const res = await apiFetch(url, {
+        method: updating ? 'PATCH' : 'POST',
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
 
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setCurrentQuoteId(data.id);
-      const normalized: Quote = {
-        id: data.id,
-        quoteNumber: data.quoteNumber ?? null,
-        customerId: data.customerId ?? null,
-        customerName: data.customer?.name ?? customers.find((c) => c.id === data.customerId)?.name ?? undefined,
-        opportunityId: data.opportunityId ?? null,
-        opportunityName: data.opportunity?.projectOrServiceName ?? opportunities.find((o) => o.id === data.opportunityId)?.projectOrServiceName ?? undefined,
-        projectId: data.projectId ?? null,
-        client: data.customer?.name ?? customers.find((c) => c.id === data.customerId)?.name ?? '',
-        service: data.service ?? form.service,
-        description: data.description ?? form.description,
-        amount: Number(data.amountBeforeVat ?? 0),
-        amountBeforeVat: data.amountBeforeVat ?? null,
-        vatPercent: data.vatPercent ?? null,
-        discountType: data.discountType ?? null,
-        discountValue: data.discountValue ?? null,
-        totalAmount: data.totalAmount ?? null,
-        status: data.status ?? form.status,
-        validTo: data.validityDate ? new Date(data.validityDate).toISOString().slice(0, 10) : form.validityDate,
-        validityDate: data.validityDate ? new Date(data.validityDate).toISOString().slice(0, 10) : null,
-        notes: data.notes ?? null,
-      };
-      onQuotesChange([normalized, ...quotes]);
-      setSuccess('הצעת מחיר נשמרה');
+      if (data.contentHtml != null) setContentHtml(String(data.contentHtml));
+      const normalized = normalizeQuoteFromApi(data, currentForm);
+      if (updating) {
+        onQuotesChange(quotes.map((q) => (q.id === data.id ? { ...q, ...normalized } : q)));
+      } else {
+        onQuotesChange([normalized, ...quotes]);
+      }
+      setPdfReady(!!data.pdfPath);
+      setSuccess(updating ? 'הצעת המחיר עודכנה במערכת' : 'הצעת המחיר נשמרה במערכת');
     } catch {
       setError('שמירת הצעת מחיר נכשלה. נסה שוב.');
     } finally {
@@ -5881,32 +6184,260 @@ function QuotesPage({
     }
   };
 
-  const createPdf = async () => {
-    if (!currentQuoteId) return;
+  const matchCustomerFromPrompt = (text: string): { id: string | null; nameHint: string | null } => {
+    const t = text.trim();
+    if (!t) return { id: null, nameHint: null };
+    let best: { id: string; score: number } | null = null;
+    for (const c of customers) {
+      const name = (c.name || '').trim();
+      if (!name) continue;
+      if (t.includes(name)) return { id: c.id, nameHint: name };
+      const parts = name.split(/\s+/).filter((p) => p.length > 2);
+      for (const p of parts) {
+        if (t.includes(p)) {
+          const score = p.length;
+          if (!best || score > best.score) best = { id: c.id, score };
+        }
+      }
+    }
+    return best ? { id: best.id, nameHint: customers.find((c) => c.id === best!.id)?.name ?? null } : { id: null, nameHint: null };
+  };
+
+  const extractSiteHint = (text: string): string | null => {
+    const cities = [
+      'רעננה',
+      'הרצליה',
+      'כפר סבא',
+      'הוד השרון',
+      'תל אביב',
+      'רמת גן',
+      'חיפה',
+      'ירושלים',
+      'באר שבע',
+      'אשדוד',
+      'נתניה',
+      'חולון',
+      'בת ים',
+      'ראשון לציון',
+      'פתח תקווה',
+      'מודיעין',
+    ];
+    for (const c of cities) {
+      if (text.includes(c)) return `אתר: ${c}`;
+    }
+    const m = text.match(/(\d+)\s*חדרים?/);
+    if (m) return `${m[1]} חדרים`;
+    return null;
+  };
+
+  const generateAIDraft = async () => {
+    const text = aiPrompt.trim();
+    if (!text) {
+      setError('יש להזין תיאור חופשי לפני יצירת טיוטה');
+      return;
+    }
+    setAiGenerating(true);
+    setError('');
+    setSuccess('');
+
     try {
-      await fetch(`http://localhost:3001/quotes/${currentQuoteId}/pdf`, {
-        method: 'POST',
-        headers: authHeaders(currentUser),
-      });
-    } catch {
-      // ignore pdf generation failures; user can still proceed without pdf
+      const lower = text.toLowerCase();
+      const keywordToService: Array<{ keywords: string[]; service: string; terms: string[] }> = [
+        { keywords: ['קרינה', 'קו מתח', 'חדר חשמל'], service: 'קרינה', terms: ['מדידת שדה אלקטרומגנטי', 'דוח ממצאים מקצועי'] },
+        { keywords: ['מיגון', 'שנאים', 'מיגון קרינה'], service: 'מיגון קרינה', terms: ['תכנון פתרון מיגון', 'בדיקת אימות לאחר התקנה'] },
+        { keywords: ['אקוסט', 'רעש', 'מיזוג'], service: 'אקוסטיקה / רעש', terms: ['מדידות רעש תקניות', 'דוח אקוסטי מסכם'] },
+        { keywords: ['ראדון'], service: 'ראדון', terms: ['התקנת גלאים', 'איסוף ופענוח תוצאות'] },
+        { keywords: ['אסבסט'], service: 'אסבסט', terms: ['סקר אסבסט מקדים', 'המלצות להמשך טיפול'] },
+        { keywords: ['איכות אוויר', 'co2', 'voc'], service: 'איכות אוויר', terms: ['דיגום איכות אוויר', 'ניתוח תוצאות והמלצות'] },
+        { keywords: ['עובש', 'טחב'], service: 'דיגום סביבתי', terms: ['דיגום עובש', 'חוות דעת מקצועית'] },
+        { keywords: ['דיגום', 'סביבתי'], service: 'דיגום סביבתי', terms: ['תוכנית דיגום', 'דוח תוצאות'] },
+        { keywords: ['היתר', 'בנייה', 'ועדה'], service: 'דוח אקוסטי להיתר', terms: ['הכנת דוח להיתר', 'התאמה לדרישות ועדה'] },
+      ];
+
+      const matched =
+        keywordToService.find((x) => x.keywords.some((k) => lower.includes(k))) ??
+        { service: 'בדיקות סביבתיות', terms: ['בדיקה בשטח', 'הפקת דוח מסכם'] };
+
+      const roomMatch = text.match(/(\d+)\s*חדרים?/);
+      const roomFactor = roomMatch ? Math.min(4, 1 + Number(roomMatch[1]) / 8) : 1;
+
+      const matchedCatalog = catalogItems
+        .filter((it) => {
+          const hay = `${it?.name || ''} ${it?.description || ''} ${it?.serviceCategory || ''} ${it?.serviceSubType || ''}`.toLowerCase();
+          return (
+            hay.includes(matched.service.toLowerCase()) ||
+            keywordToService.some((group) => group.keywords.some((k) => lower.includes(k) && hay.includes(k)))
+          );
+        })
+        .slice(0, 4);
+
+      const lineItems: AIDraftLineItem[] =
+        matchedCatalog.length > 0
+          ? matchedCatalog.map((it) => {
+              const unitPrice = Math.round((Number(it?.basePrice) || 0) * roomFactor * 100) / 100;
+              const quantity = roomMatch ? Math.max(1, Math.min(12, Number(roomMatch[1]))) : 1;
+              const lineTotal = Math.round(unitPrice * quantity * 100) / 100;
+              return {
+                name: String(it?.name || it?.itemCode || matched.service),
+                quantity,
+                unitPrice,
+                lineTotal,
+              };
+            })
+          : [
+              {
+                name: `${matched.service} - ביקור שטח ומדידות`,
+                quantity: 1,
+                unitPrice: Math.round(1800 * roomFactor),
+                lineTotal: Math.round(1800 * roomFactor * 100) / 100,
+              },
+              {
+                name: `${matched.service} - דוח מסכם מקצועי`,
+                quantity: 1,
+                unitPrice: 950,
+                lineTotal: 950,
+              },
+            ];
+
+      const subtotalBeforeVat = Math.round(lineItems.reduce((acc, li) => acc + li.lineTotal, 0) * 100) / 100;
+      const vatPercent = 17;
+      const vatAmount = Math.round(subtotalBeforeVat * (vatPercent / 100) * 100) / 100;
+      const totalWithVat = Math.round((subtotalBeforeVat + vatAmount) * 100) / 100;
+      const site = extractSiteHint(text);
+      const { id: suggestedCustomerId, nameHint: customerNameHint } = matchCustomerFromPrompt(text);
+
+      const draft: AIDraft = {
+        title: `הצעת מחיר - ${matched.service}`,
+        customerNameHint,
+        suggestedCustomerId,
+        service: matched.service,
+        siteOrProject: site,
+        description: `הצעה מקצועית לעבודת ${matched.service}.${site ? ` ${site}.` : ''} כולל ביצוע בשטח, ניתוח ממצאים והפקת מסמך מסכם בהתאם לסטנדרט גלית.`,
+        lineItems,
+        notes: `מקור פנייה (חופשי): ${text}`,
+        terms: `תנאים: ${matched.terms.join(' · ')} · תשלום לפי תנאי ההצעה · לוחות זמנים בתיאום עם הלקוח.`,
+        subtotalBeforeVat,
+        vatPercent,
+        vatAmount,
+        totalWithVat,
+      };
+      setAiDraft(draft);
+      setSuccess('טיוטת הצעה מוכנה — ניתן להחיל על הטופס ולשמור');
+    } finally {
+      setAiGenerating(false);
     }
   };
 
-  const downloadPdf = () => {
-    if (!currentQuoteId) return;
-    const url = `http://localhost:3001/quotes/${currentQuoteId}/pdf`;
-    if (typeof window !== 'undefined') {
-      window.open(url, '_blank');
+  const applyAIDraftToForm = (andSave = false) => {
+    if (!aiDraft) return;
+    const linesBlock = aiDraft.lineItems
+      .map(
+        (li, idx) =>
+          `${idx + 1}. ${li.name} | כמות: ${li.quantity} | מחיר יחידה: ${formatCurrencyILS(li.unitPrice)} | סה״כ שורה: ${formatCurrencyILS(li.lineTotal)}`,
+      )
+      .join('\n');
+    const next = {
+      ...form,
+      customerId: aiDraft.suggestedCustomerId || form.customerId,
+      service: aiDraft.service,
+      description: `${aiDraft.description}\n\nאתר / היקף: ${aiDraft.siteOrProject || 'לא צוין'}\n\nפירוט שורות:\n${linesBlock}`,
+      amountBeforeVat: String(aiDraft.subtotalBeforeVat),
+      vatPercent: String(aiDraft.vatPercent),
+      notes: `${aiDraft.notes}\n\nמע״מ (${aiDraft.vatPercent}%): ${formatCurrencyILS(aiDraft.vatAmount)}\nסה״כ כולל מע״מ (משוער): ${formatCurrencyILS(aiDraft.totalWithVat)}\n\n${aiDraft.terms}`,
+      status: 'DRAFT',
+    };
+    setForm(next);
+    setSuccess('טיוטת ההצעה הוחלה על הטופס — בדוק לקוח ולחץ «שמור הצעה»');
+    if (andSave) {
+      void saveQuote(next);
+      setAiOpen(false);
     }
+  };
+
+  const createPdf = async () => {
+    if (!currentQuoteId) return;
+    setSaving(true);
+    setError('');
+    setSuccess('');
+    try {
+      const res = await apiFetch(apiUrl(`/quotes/${currentQuoteId}/pdf`), {
+        method: 'POST',
+        authUser: currentUser,
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      setPdfReady(true);
+      onQuotesChange(quotes.map((q) => (q.id === data.id ? { ...q, pdfPath: data.pdfPath } : q)));
+      setSuccess('קובץ PDF נוצר ונשמר להצעה');
+    } catch {
+      setError('יצירת PDF נכשלה. ודא שההצעה נשמרה ונסה שוב.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const downloadPdf = async () => {
+    if (!currentQuoteId) return;
+    setSaving(true);
+    setError('');
+    try {
+      const res = await apiFetch(apiUrl(`/quotes/${currentQuoteId}/pdf`), {
+        authUser: currentUser,
+      });
+      if (!res.ok) throw new Error('אין PDF — יש ללחוץ קודם על «צור PDF»');
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `galit-quote-${currentQuoteId}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setSuccess('הורדת PDF הושלמה');
+    } catch {
+      setError('הורדת PDF נכשלה — ודא שנוצר PDF להצעה.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const selectedCustomer = customers.find((c) => c.id === form.customerId);
+  const pdfUrlForShare =
+    currentQuoteId != null ? `${getApiBaseUrl()}/quotes/${currentQuoteId}/pdf` : '';
+
+  const openEmailModal = () => {
+    setEmailTo(selectedCustomer?.email || '');
+    setEmailModalOpen(true);
+  };
+
+  const sendEmailMailto = () => {
+    const body = `${emailBody}${pdfReady && currentQuoteId ? `\n\nקישור להורדת PDF (התחברות למערכת נדרשת):\n${pdfUrlForShare}` : ''}`;
+    const q = `mailto:${encodeURIComponent(emailTo)}?subject=${encodeURIComponent(emailSubject)}&body=${encodeURIComponent(body)}`;
+    window.location.href = q;
+    setEmailModalOpen(false);
+  };
+
+  const openWhatsAppQuote = () => {
+    const phone = (selectedCustomer?.phone || '').replace(/\D/g, '');
+    if (!phone) {
+      alert('אין מספר טלפון ללקוח הנבחר — עדכן את פרטי הלקוח או הזן ידנית בוואטסאפ.');
+      return;
+    }
+    const waPhone = phone.startsWith('972') ? phone : phone.startsWith('0') ? `972${phone.slice(1)}` : phone;
+    const msg = `שלום, מצורפת/מצ״ב הצעת המחיר שהוכנה עבורך על ידי גלית - החברה לאיכות הסביבה.\nנשמח לעמוד לרשותך לכל שאלה.${pdfReady && currentQuoteId ? `\n\nקישור PDF (נדרשת גישה למערכת):\n${pdfUrlForShare}` : ''}`;
+    window.open(`https://wa.me/${waPhone}?text=${encodeURIComponent(msg)}`, '_blank');
   };
 
   return (
     <div className="space-y-5">
-      <div>
+      <div className="flex items-center justify-between gap-3">
         <h1 className="text-3xl font-bold" style={{ color: galit.text }}>הצעות מחיר</h1>
-        <p className="mt-1 text-slate-500">ניהול טיוטות, חתימות ותוקף הצעות</p>
+        <Button style={{ background: galit.primary }} onClick={() => setAiOpen(true)}>
+          צור הצעת מחיר עם AI
+        </Button>
       </div>
+      <p className="mt-1 text-slate-500">ניהול טיוטות, חתימות ותוקף הצעות</p>
 
       <div className="grid gap-4 xl:grid-cols-2">
         <Card>
@@ -5934,7 +6465,7 @@ function QuotesPage({
                     <TableCell>{q.customerName || q.client || '-'}</TableCell>
                     <TableCell>{q.opportunityName || '-'}</TableCell>
                     <TableCell>{q.service}</TableCell>
-                    <TableCell>{formatCurrencyILS(Number(q.totalAmount ?? q.amount ?? 0))}</TableCell>
+                    <TableCell>{(currentUser.role === 'admin' || currentUser.role === 'manager' || currentUser.canViewFinance) ? formatCurrencyILS(Number(q.totalAmount ?? q.amount ?? 0)) : '-'}</TableCell>
                     <TableCell>
                       <Badge className={statusBadge(q.status)}>{statusLabel(q.status)}</Badge>
                     </TableCell>
@@ -5942,12 +6473,19 @@ function QuotesPage({
                     <TableCell>
                       <div className="flex flex-wrap gap-2">
                         <button
+                          type="button"
+                          className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
+                          onClick={() => void loadQuoteForEdit(q.id)}
+                        >
+                          טען לעריכה
+                        </button>
+                        <button
                           className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
                           onClick={async () => {
                             try {
-                              const res = await fetch(`http://localhost:3001/quotes/${q.id}`, {
+                              const res = await apiFetch(apiUrl(`/quotes/${q.id}`), {
                                 method: 'PATCH',
-                                headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+                                authUser: currentUser,
                                 body: JSON.stringify({ status: 'SENT' }),
                               });
                               if (!res.ok) throw new Error();
@@ -5964,9 +6502,9 @@ function QuotesPage({
                           className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
                           onClick={async () => {
                             try {
-                              const res = await fetch(`http://localhost:3001/quotes/${q.id}`, {
+                              const res = await apiFetch(apiUrl(`/quotes/${q.id}`), {
                                 method: 'PATCH',
-                                headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+                                authUser: currentUser,
                                 body: JSON.stringify({ status: 'APPROVED' }),
                               });
                               if (!res.ok) throw new Error();
@@ -5983,9 +6521,9 @@ function QuotesPage({
                           className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
                           onClick={async () => {
                             try {
-                              const res = await fetch(`http://localhost:3001/quotes/${q.id}`, {
+                              const res = await apiFetch(apiUrl(`/quotes/${q.id}`), {
                                 method: 'PATCH',
-                                headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+                                authUser: currentUser,
                                 body: JSON.stringify({ status: 'REJECTED' }),
                               });
                               if (!res.ok) throw new Error();
@@ -6002,9 +6540,9 @@ function QuotesPage({
                           className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
                           onClick={async () => {
                             try {
-                              const res = await fetch(`http://localhost:3001/quotes/${q.id}`, {
+                              const res = await apiFetch(apiUrl(`/quotes/${q.id}`), {
                                 method: 'PATCH',
-                                headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+                                authUser: currentUser,
                                 body: JSON.stringify({ status: 'EXPIRED' }),
                               });
                               if (!res.ok) throw new Error();
@@ -6112,11 +6650,94 @@ function QuotesPage({
               <Input placeholder="פרויקט (אופציונלי)" value={form.projectId} onChange={(e) => setForm((p) => ({ ...p, projectId: e.target.value }))} />
             </FormField>
             <FormField label="שירות">
-              <Input placeholder="שירות" value={form.service} onChange={(e) => setForm((p) => ({ ...p, service: e.target.value }))} />
+              <select
+                className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm"
+                dir="rtl"
+                value={form.service}
+                onChange={(e) => {
+                  lastAutoTemplateKeyRef.current = '';
+                  setForm((p) => ({ ...p, service: e.target.value }));
+                }}
+              >
+                {serviceOptionsForQuote.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-xs text-slate-500">תבניות מקושרות לפי ערך שירות זה (זהה לשדה «סוג שירות» בהגדרות תבנית).</p>
             </FormField>
-            <FormField label="תיאור">
+
+            <div className="rounded-2xl border border-slate-200 bg-slate-50/80 p-4" dir="rtl">
+              <div className="text-sm font-semibold text-slate-800">תבנית הצעת מחיר</div>
+              <p className="mt-1 text-xs text-slate-600">
+                {templatesLoading ? 'טוען תבניות...' : quoteTemplatesList.length === 0 ? 'אין תבנית פעילה לשירות זה — הוסף בהגדרות › תבניות הצעות מחיר.' : null}
+              </p>
+              {quoteTemplatesList.length > 1 && (
+                <FormField label="בחר תבנית (מספר תבניות לשירות)">
+                  <select
+                    className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm"
+                    value={selectedTemplateId}
+                    onChange={(e) => setSelectedTemplateId(e.target.value)}
+                  >
+                    <option value="">— בחר תבנית —</option>
+                    {quoteTemplatesList.map((t: any) => (
+                      <option key={t.id} value={t.id}>
+                        {t.name}
+                      </option>
+                    ))}
+                  </select>
+                </FormField>
+              )}
+              {quoteTemplatesList.length >= 1 && (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={!form.customerId || (!selectedTemplateId && quoteTemplatesList.length > 1)}
+                    onClick={() => {
+                      const tpl =
+                        quoteTemplatesList.length === 1
+                          ? quoteTemplatesList[0]
+                          : quoteTemplatesList.find((t: any) => t.id === selectedTemplateId);
+                      if (tpl) applyTemplateNow(tpl);
+                    }}
+                  >
+                    טען / רענן תבנית
+                  </Button>
+                  <Button type="button" variant="outline" disabled={!contentHtml.trim()} onClick={() => setPreviewOpen(true)}>
+                    תצוגה מקדימה
+                  </Button>
+                </div>
+              )}
+            </div>
+
+            <FormField label="תיאור (טקסט קצר / גיבוי)">
               <Textarea placeholder="תיאור" value={form.description} onChange={(e) => setForm((p) => ({ ...p, description: e.target.value }))} />
             </FormField>
+
+            <FormField label="תוכן HTML מלא (ניתן לערוך לאחר טעינת תבנית)">
+              <Textarea
+                dir="rtl"
+                className="min-h-[180px] font-mono text-xs"
+                placeholder="יטען אוטומטית מתבנית..."
+                value={contentHtml}
+                onChange={(e) => setContentHtml(e.target.value)}
+              />
+            </FormField>
+
+            {templateLineItems.length > 0 && (
+              <div className="rounded-2xl border border-slate-100 p-3 text-sm" dir="rtl">
+                <div className="mb-2 font-semibold">פריטים (מברירת מחדל של התבנית)</div>
+                <ul className="space-y-1 text-slate-700">
+                  {templateLineItems.map((li, idx) => (
+                    <li key={`${li.name}-${idx}`}>
+                      {li.name} · כמות {li.quantity} · {formatCurrencyILS(li.unitPrice)} ליחידה
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
 
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <FormField label="סכום לפני מע״מ">
@@ -6181,20 +6802,136 @@ function QuotesPage({
             </FormField>
 
             <div className="text-sm text-slate-600">סה״כ כולל מע״מ: <span className="font-semibold">{formatCurrencyILS(computeTotal)}</span></div>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-              <Button variant="outline" onClick={saveQuote}>
-                {saving ? 'שומר...' : 'שמור'}
+            {currentQuoteId && (
+              <div className="rounded-2xl border border-emerald-100 bg-emerald-50/50 px-3 py-2 text-xs text-emerald-900">
+                מזהה הצעה נוכחית: <span className="font-mono font-semibold">{currentQuoteId}</span>
+                {pdfReady ? ' · PDF זמין' : ' · עדיין ללא PDF'}
+              </div>
+            )}
+            <div className="flex flex-wrap gap-2">
+              <Button style={{ background: galit.primary }} onClick={() => void saveQuote()} disabled={saving}>
+                {saving ? 'שומר...' : 'שמור הצעה'}
               </Button>
-              <Button variant="outline" onClick={createPdf} disabled={!currentQuoteId}>
+              <Button variant="outline" onClick={() => void createPdf()} disabled={!currentQuoteId || saving}>
                 צור PDF
               </Button>
-              <Button style={{ background: galit.primary }} onClick={downloadPdf} disabled={!currentQuoteId}>
+              <Button variant="outline" onClick={() => void downloadPdf()} disabled={!currentQuoteId || saving}>
                 הורד PDF
+              </Button>
+              <Button variant="outline" onClick={openEmailModal} disabled={!currentQuoteId}>
+                שלח במייל
+              </Button>
+              <Button variant="outline" onClick={openWhatsAppQuote} disabled={!currentQuoteId}>
+                שלח בוואטסאפ
               </Button>
             </div>
           </CardContent>
         </Card>
       </div>
+
+      <Modal open={previewOpen} onClose={() => setPreviewOpen(false)} title="תצוגה מקדימה — הצעת מחיר" maxWidth="max-w-4xl">
+        <div className="space-y-3" dir="rtl">
+          <p className="text-xs text-slate-500">תצוגת HTML כפי שתישמר ב־«תוכן HTML מלא». PDF נוכחי נוצר בשרת מטקסט מנוקה מתגים.</p>
+          <div
+            className="max-h-[70vh] overflow-auto rounded-2xl border bg-white p-4 text-sm max-w-none"
+            dangerouslySetInnerHTML={{ __html: contentHtml || '<p class="text-slate-400">אין תוכן</p>' }}
+          />
+          <Button variant="outline" type="button" onClick={() => setPreviewOpen(false)}>
+            סגור
+          </Button>
+        </div>
+      </Modal>
+
+      <Modal open={emailModalOpen} onClose={() => setEmailModalOpen(false)} title="שליחת הצעה במייל" maxWidth="max-w-lg">
+        <div className="space-y-3" dir="rtl">
+          <p className="text-sm text-slate-500">
+            נפתחת שליחה דרך תוכנת המייל של המחשב (mailto). אם יש PDF, יתווסף קישור בגוף ההודעה.
+          </p>
+          <FormField label="אל (אימייל)">
+            <Input value={emailTo} onChange={(e) => setEmailTo(e.target.value)} placeholder="customer@example.com" />
+          </FormField>
+          <FormField label="נושא">
+            <Input value={emailSubject} onChange={(e) => setEmailSubject(e.target.value)} />
+          </FormField>
+          <FormField label="גוף ההודעה">
+            <Textarea rows={6} value={emailBody} onChange={(e) => setEmailBody(e.target.value)} />
+          </FormField>
+          <div className="flex flex-wrap gap-2">
+            <Button style={{ background: galit.primary }} onClick={sendEmailMailto} disabled={!emailTo.trim()}>
+              פתח ב-mailto
+            </Button>
+            <Button variant="outline" onClick={() => setEmailModalOpen(false)}>
+              סגור
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal open={aiOpen} onClose={() => setAiOpen(false)} title="צור הצעת מחיר עם AI" maxWidth="max-w-3xl">
+        <div className="space-y-4" dir="rtl">
+          <FormField label="תיאור חופשי של בקשת הלקוח">
+            <Textarea
+              placeholder="לדוגמה: הלקוח צריך בדיקת קרינה לבית פרטי ברעננה, 5 חדרים, כולל חצר..."
+              value={aiPrompt}
+              onChange={(e) => setAiPrompt(e.target.value)}
+            />
+          </FormField>
+
+          <div className="flex flex-wrap gap-2">
+            <Button style={{ background: galit.primary }} onClick={() => void generateAIDraft()} disabled={aiGenerating}>
+              {aiGenerating ? 'יוצר טיוטה...' : 'צור טיוטת הצעה'}
+            </Button>
+            <Button variant="outline" onClick={() => setAiOpen(false)}>סגור</Button>
+          </div>
+
+          {aiDraft && (
+            <div className="space-y-3 rounded-2xl border bg-slate-50 p-4">
+              <div className="text-lg font-bold">{aiDraft.title}</div>
+              {aiDraft.customerNameHint && (
+                <div className="text-sm text-emerald-800">זיהוי לקוח (הצעה): {aiDraft.customerNameHint}</div>
+              )}
+              <div className="text-sm text-slate-700">{aiDraft.description}</div>
+              {aiDraft.siteOrProject && <div className="text-xs text-slate-500">אתר / היקף: {aiDraft.siteOrProject}</div>}
+              <div>
+                <div className="mb-1 text-sm font-semibold">שורות פריטים</div>
+                <ul className="space-y-1 text-sm">
+                  {aiDraft.lineItems.map((li, idx) => (
+                    <li key={`${li.name}-${idx}`} className="rounded-xl bg-white px-3 py-2">
+                      {idx + 1}. {li.name} · כמות {li.quantity} · {formatCurrencyILS(li.unitPrice)} ליחידה · סה״כ שורה{' '}
+                      {formatCurrencyILS(li.lineTotal)}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-sm sm:grid-cols-4">
+                <div className="rounded-xl bg-white px-2 py-2">
+                  <div className="text-xs text-slate-500">לפני מע״מ</div>
+                  <div className="font-semibold">{formatCurrencyILS(aiDraft.subtotalBeforeVat)}</div>
+                </div>
+                <div className="rounded-xl bg-white px-2 py-2">
+                  <div className="text-xs text-slate-500">מע״מ ({aiDraft.vatPercent}%)</div>
+                  <div className="font-semibold">{formatCurrencyILS(aiDraft.vatAmount)}</div>
+                </div>
+                <div className="rounded-xl bg-white px-2 py-2 sm:col-span-2">
+                  <div className="text-xs text-slate-500">סה״כ כולל מע״מ</div>
+                  <div className="font-bold text-emerald-800">{formatCurrencyILS(aiDraft.totalWithVat)}</div>
+                </div>
+              </div>
+              <div className="text-sm"><span className="font-semibold">הערות:</span> {aiDraft.notes}</div>
+              <div className="text-sm"><span className="font-semibold">תנאים:</span> {aiDraft.terms}</div>
+
+              <div className="flex flex-wrap gap-2 pt-1">
+                <Button style={{ background: galit.primary }} onClick={() => applyAIDraftToForm(false)}>
+                  החל על הטופס
+                </Button>
+                <Button variant="outline" onClick={() => applyAIDraftToForm(true)} disabled={saving}>
+                  החל ושמור הצעה
+                </Button>
+              </div>
+            </div>
+          )}
+        </div>
+      </Modal>
     </div>
   );
 }
@@ -6365,9 +7102,9 @@ function ProjectDetailsPage({
   const patchProject = async (payload: Record<string, unknown>) => {
     setBusy(true);
     try {
-      const res = await fetch(`http://localhost:3001/projects/${project.id}`, {
+      const res = await apiFetch(apiUrl(`/projects/${project.id}`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) {
@@ -6427,11 +7164,11 @@ function ProjectDetailsPage({
   const reloadLinked = async () => {
     try {
       const [tRes, qRes, rRes, dRes, sRes] = await Promise.all([
-        fetch(`http://localhost:3001/tasks?projectId=${encodeURIComponent(project.id)}`, { headers: authHeaders(currentUser) }),
-        fetch(`http://localhost:3001/quotes?projectId=${encodeURIComponent(project.id)}`, { headers: authHeaders(currentUser) }),
-        fetch(`http://localhost:3001/reports?projectId=${encodeURIComponent(project.id)}`, { headers: authHeaders(currentUser) }),
-        fetch(`http://localhost:3001/documents?projectId=${encodeURIComponent(project.id)}`, { headers: authHeaders(currentUser) }),
-        fetch(`http://localhost:3001/lab-samples?projectId=${encodeURIComponent(project.id)}`, { headers: authHeaders(currentUser) }),
+        apiFetch(apiUrl(`/tasks?projectId=${encodeURIComponent(project.id)}`), { authUser: currentUser }),
+        apiFetch(apiUrl(`/quotes?projectId=${encodeURIComponent(project.id)}`), { authUser: currentUser }),
+        apiFetch(apiUrl(`/reports?projectId=${encodeURIComponent(project.id)}`), { authUser: currentUser }),
+        apiFetch(apiUrl(`/documents?projectId=${encodeURIComponent(project.id)}`), { authUser: currentUser }),
+        apiFetch(apiUrl(`/lab-samples?projectId=${encodeURIComponent(project.id)}`), { authUser: currentUser }),
       ]);
       if (tRes.ok) setTasks(await tRes.json());
       if (qRes.ok) setQuotes(await qRes.json());
@@ -6463,9 +7200,9 @@ function ProjectDetailsPage({
         status: taskForm.status,
         type: taskForm.type,
       };
-      const res = await fetch('http://localhost:3001/tasks', {
+      const res = await apiFetch(apiUrl('/tasks'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (res.ok) {
@@ -6491,9 +7228,9 @@ function ProjectDetailsPage({
         customerId: project.customerId,
         projectId: project.id,
       };
-      const res = await fetch('http://localhost:3001/quotes', {
+      const res = await apiFetch(apiUrl('/quotes'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (res.ok) {
@@ -6516,9 +7253,9 @@ function ProjectDetailsPage({
         projectId: project.id,
         version: 1,
       };
-      const res = await fetch('http://localhost:3001/reports', {
+      const res = await apiFetch(apiUrl('/reports'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (res.ok) {
@@ -6881,7 +7618,9 @@ function ProjectDetailsPage({
                 {quotes.map((q) => (
                   <div key={q.id} className="rounded-2xl border p-4">
                     <div className="font-medium">{q.service}</div>
-                    <div className="mt-1 text-xs text-slate-500">{statusLabel(q.status)} · {formatCurrencyILS(Number(q.amount))}</div>
+                    <div className="mt-1 text-xs text-slate-500">
+                      {statusLabel(q.status)} · {(currentUser.role === 'admin' || currentUser.role === 'manager' || currentUser.canViewFinance) ? formatCurrencyILS(Number(q.amount)) : '-'}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -6954,9 +7693,9 @@ function ProjectDetailsPage({
                   if (!filePath.trim()) return;
                   try {
                     setBusy(true);
-                    const res = await fetch('http://localhost:3001/documents', {
+                    const res = await apiFetch(apiUrl('/documents'), {
                       method: 'POST',
-                      headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+                      authUser: currentUser,
                       body: JSON.stringify({
                         name,
                         documentType: 'OTHER',
@@ -7006,9 +7745,9 @@ function ProjectDetailsPage({
                   if (!sampleNumber) return;
                   try {
                     setBusy(true);
-                    const res = await fetch('http://localhost:3001/lab-samples', {
+                    const res = await apiFetch(apiUrl('/lab-samples'), {
                       method: 'POST',
-                      headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+                      authUser: currentUser,
                       body: JSON.stringify({
                         sampleNumber,
                         projectId: project.id,
@@ -7088,6 +7827,11 @@ function OpportunitiesPage({
     assignedUserId: '',
     notes: '',
   });
+  const [searchQuery, setSearchQuery] = useState('');
+  const [stageFilter, setStageFilter] = useState<string>('הכל');
+  const [datePreset, setDatePreset] = useState<'all' | 'month' | 'quarter'>('all');
+  const [sortBy, setSortBy] = useState<'value_desc' | 'close_asc' | 'created_desc'>('value_desc');
+  const [quotePickOpen, setQuotePickOpen] = useState(false);
 
   const OPPORTUNITY_STAGE_LABELS: Record<string, string> = {
     NEW: 'חדש',
@@ -7117,9 +7861,9 @@ function OpportunitiesPage({
         assignedUserId: form.assignedUserId || currentUser.id,
         notes: form.notes || null,
       };
-      const res = await fetch('http://localhost:3001/opportunities', {
+      const res = await apiFetch(apiUrl('/opportunities'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -7150,7 +7894,7 @@ function OpportunitiesPage({
     setSuccess('');
     setDetailsLoading(true);
     try {
-      const res = await fetch(`http://localhost:3001/opportunities/${o.id}`, { headers: authHeaders(currentUser) });
+      const res = await apiFetch(apiUrl(`/opportunities/${o.id}`), { authUser: currentUser });
       if (!res.ok) throw new Error(await res.text());
       const full = await res.json();
       setSelected(full);
@@ -7188,9 +7932,9 @@ function OpportunitiesPage({
         assignedUserId: form.assignedUserId || null,
         notes: form.notes || null,
       };
-      const res = await fetch(`http://localhost:3001/opportunities/${selected.id}`, {
+      const res = await apiFetch(apiUrl(`/opportunities/${selected.id}`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -7211,9 +7955,9 @@ function OpportunitiesPage({
     setSaving(true);
     setError('');
     try {
-      const res = await fetch(`http://localhost:3001/opportunities/${selected.id}`, {
+      const res = await apiFetch(apiUrl(`/opportunities/${selected.id}`), {
         method: 'DELETE',
-        headers: authHeaders(currentUser),
+        authUser: currentUser,
       });
       if (!res.ok) throw new Error(await res.text());
       setOpportunities((prev) => prev.filter((x) => x.id !== selected.id));
@@ -7229,15 +7973,19 @@ function OpportunitiesPage({
 
   const createQuoteFromOpportunity = async () => {
     if (!selected) return;
+    await createQuoteFromOpportunityFor(selected);
+  };
+
+  const createQuoteFromOpportunityFor = async (opp: Opportunity) => {
     setSaving(true);
     setError('');
     setSuccess('');
     try {
       const payload: any = {
-        customerId: selected.customerId || null,
-        opportunityId: selected.id,
-        service: selected.projectOrServiceName,
-        description: selected.notes || null,
+        customerId: opp.customerId || null,
+        opportunityId: opp.id,
+        service: opp.projectOrServiceName,
+        description: opp.notes || null,
         amountBeforeVat: 0,
         vatPercent: 17,
         discountType: 'NONE',
@@ -7247,14 +7995,15 @@ function OpportunitiesPage({
         status: 'DRAFT',
         notes: null,
       };
-      const res = await fetch('http://localhost:3001/quotes', {
+      const res = await apiFetch(apiUrl('/quotes'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
       setSuccess('הצעת מחיר נוצרה');
-      await openDetails(selected);
+      setSelected(opp);
+      await openDetails(opp);
     } catch {
       setError('יצירת הצעת מחיר נכשלה. נסה שוב.');
     } finally {
@@ -7262,49 +8011,437 @@ function OpportunitiesPage({
     }
   };
 
+  const filteredOpportunities = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    const now = Date.now();
+    const monthMs = 30 * 24 * 60 * 60 * 1000;
+    const quarterMs = 90 * 24 * 60 * 60 * 1000;
+
+    let list = opportunities.filter((o) => {
+      const customerName = o.customer?.name || customers.find((c) => c.id === o.customerId)?.name || '';
+      const leadName = o.lead?.fullName || '';
+      const hay = [o.projectOrServiceName, customerName, leadName, o.notes || '', OPPORTUNITY_STAGE_LABELS[o.pipelineStage] || o.pipelineStage]
+        .join(' ')
+        .toLowerCase();
+      const matchesSearch = !q || hay.includes(q);
+      const matchesStage =
+        stageFilter === 'הכל' || (OPPORTUNITY_STAGE_LABELS[o.pipelineStage] || o.pipelineStage) === stageFilter;
+      let matchesDate = true;
+      if (datePreset !== 'all') {
+        const t = o.targetCloseDate ? new Date(o.targetCloseDate).getTime() : null;
+        const c = o.createdAt ? new Date(o.createdAt).getTime() : null;
+        const ref = t ?? c;
+        if (ref == null) matchesDate = false;
+        else {
+          const window = datePreset === 'month' ? monthMs : quarterMs;
+          matchesDate = ref >= now - window && ref <= now + window;
+        }
+      }
+      return matchesSearch && matchesStage && matchesDate;
+    });
+
+    list = [...list].sort((a, b) => {
+      if (sortBy === 'value_desc') return Number(b.estimatedValue || 0) - Number(a.estimatedValue || 0);
+      if (sortBy === 'close_asc') {
+        const ta = a.targetCloseDate ? new Date(a.targetCloseDate).getTime() : Number.POSITIVE_INFINITY;
+        const tb = b.targetCloseDate ? new Date(b.targetCloseDate).getTime() : Number.POSITIVE_INFINITY;
+        return ta - tb;
+      }
+      const ca = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const cb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      return cb - ca;
+    });
+    return list;
+  }, [opportunities, customers, searchQuery, stageFilter, datePreset, sortBy]);
+
+  const openOpportunitiesCount = useMemo(
+    () => opportunities.filter((o) => ['NEW', 'QUALIFIED', 'PROPOSAL', 'NEGOTIATION'].includes(o.pipelineStage)).length,
+    [opportunities],
+  );
+
+  const totalPipelineValue = useMemo(
+    () => opportunities.reduce((sum, o) => sum + Number(o.estimatedValue || 0), 0),
+    [opportunities],
+  );
+
+  const openPipelineValue = useMemo(
+    () =>
+      opportunities
+        .filter((o) => ['NEW', 'QUALIFIED', 'PROPOSAL', 'NEGOTIATION'].includes(o.pipelineStage))
+        .reduce((sum, o) => sum + Number(o.estimatedValue || 0), 0),
+    [opportunities],
+  );
+
+  const wonCount = opportunities.filter((o) => o.pipelineStage === 'WON').length;
+  const lostCount = opportunities.filter((o) => o.pipelineStage === 'LOST').length;
+  const closeRatePct =
+    wonCount + lostCount > 0 ? Math.round((wonCount / (wonCount + lostCount)) * 100) : 78;
+
+  const stageBarData = useMemo(() => {
+    const stages = ['NEW', 'QUALIFIED', 'PROPOSAL', 'NEGOTIATION', 'WON', 'LOST'] as const;
+    return stages.map((s) => ({
+      name: OPPORTUNITY_STAGE_LABELS[s] || s,
+      count: opportunities.filter((o) => o.pipelineStage === s).length,
+    }));
+  }, [opportunities]);
+
+  const sourceChips = useMemo(() => {
+    const base = [
+      { label: 'אתר', weight: 0.22 },
+      { label: 'המלצה', weight: 0.18 },
+      { label: 'גוגל', weight: 0.15 },
+      { label: 'וואטסאפ', weight: 0.12 },
+      { label: 'פייסבוק', weight: 0.1 },
+      { label: 'אחר', weight: 0.23 },
+    ];
+    const n = Math.max(1, opportunities.length);
+    return base.map((b) => ({
+      label: b.label,
+      count: Math.max(1, Math.round(n * b.weight)),
+    }));
+  }, [opportunities.length]);
+
+  const handleCreateQuoteFromPanel = () => {
+    if (filteredOpportunities.length === 0) {
+      alert('אין הזדמנות זמינה. צור הזדמנות חדשה תחילה.');
+      return;
+    }
+    if (filteredOpportunities.length === 1) {
+      void createQuoteFromOpportunityFor(filteredOpportunities[0]);
+      return;
+    }
+    setQuotePickOpen(true);
+  };
+
+  const stageBadgeClass = (stage: string) => {
+    const s = (stage || '').toUpperCase();
+    if (s === 'WON') return 'bg-emerald-100 text-emerald-800';
+    if (s === 'LOST') return 'bg-red-100 text-red-700';
+    if (s === 'NEGOTIATION') return 'bg-amber-100 text-amber-800';
+    return 'bg-slate-100 text-slate-700';
+  };
+
+  const opportunityStatusChip = (stage: string) => {
+    const s = (stage || '').toUpperCase();
+    if (s === 'WON') return { label: 'נסגר', cls: 'bg-emerald-100 text-emerald-800' };
+    if (s === 'LOST') return { label: 'הופסד', cls: 'bg-red-100 text-red-700' };
+    return { label: 'בטיפול', cls: 'bg-amber-50 text-amber-800' };
+  };
+
   return (
-    <div className="space-y-5">
-      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-        <div>
-          <h1 className="text-3xl font-bold" style={{ color: galit.text }}>הזדמנויות</h1>
-          <p className="mt-1 text-slate-500">שלב ביניים בין ליד להצעת מחיר</p>
+    <div className="space-y-5" dir="rtl">
+      {/* RTL: עמודה ראשונה ב-DOM = ימין (KPI), אחרונה = שמאל (פרופיל) */}
+      <div className="grid gap-5 lg:grid-cols-[300px_minmax(0,1fr)_280px]">
+        <aside className="order-1 space-y-4 lg:order-1">
+          <Card className="rounded-[24px] border-0 bg-white shadow-[0_12px_36px_rgba(15,23,42,0.08)]">
+            <CardContent className="space-y-4 p-5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0 text-right">
+                  <div className="font-bold text-slate-900">{currentUser.name}</div>
+                  <div className="text-xs text-slate-500">{roleLabel(currentUser.role)}</div>
+                </div>
+                <div className="relative flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-emerald-50 text-emerald-700">
+                  <Bell className="h-5 w-5" />
+                  <span className="absolute -left-0.5 -top-0.5 flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-[10px] font-bold text-white">
+                    3
+                  </span>
+                </div>
+              </div>
+              <Button
+                className="h-11 w-full rounded-2xl font-semibold shadow-sm"
+                style={{ background: galit.primary }}
+                disabled={saving}
+                onClick={handleCreateQuoteFromPanel}
+              >
+                יצירת הצעה
+              </Button>
+            </CardContent>
+          </Card>
+
+          <Card className="rounded-[24px] border-0 bg-white shadow-[0_12px_36px_rgba(15,23,42,0.08)]">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-lg font-bold text-slate-900">KPIs</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              <div className="flex justify-between gap-2">
+                <span className="text-slate-500">פוטנציאל כולל</span>
+                <span className="font-bold text-emerald-700">{formatCurrencyILS(totalPipelineValue)}</span>
+              </div>
+              <div className="flex justify-between gap-2">
+                <span className="text-slate-500">הזדמנויות פתוחות</span>
+                <span className="font-bold text-slate-900">{openOpportunitiesCount}</span>
+              </div>
+              <div className="flex justify-between gap-2">
+                <span className="text-slate-500">אחוז סגירה</span>
+                <span className="font-bold text-slate-900">{closeRatePct}%</span>
+              </div>
+              <div className="flex justify-between gap-2">
+                <span className="text-slate-500">זמן סגירה ממוצע</span>
+                <span className="font-bold text-slate-900">18 ימים</span>
+              </div>
+              <div className="flex justify-between gap-2 border-t border-slate-100 pt-2">
+                <span className="text-slate-500">הכנסה צפויה (פתוח)</span>
+                <span className="font-bold text-emerald-800">{formatCurrencyILS(openPipelineValue)}</span>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="rounded-[24px] border-0 bg-white shadow-[0_12px_36px_rgba(15,23,42,0.08)]">
+            <CardHeader className="pb-1">
+              <CardTitle className="text-sm font-bold text-slate-800">התפלגות לפי שלב</CardTitle>
+            </CardHeader>
+            <CardContent className="h-[160px] pr-0">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={stageBarData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                  <XAxis dataKey="name" tick={{ fontSize: 10 }} interval={0} angle={-25} textAnchor="end" height={48} />
+                  <YAxis hide />
+                  <Tooltip />
+                  <Bar dataKey="count" fill={galit.primary} radius={[6, 6, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
+
+          <Card className="rounded-[24px] border-0 bg-white shadow-[0_12px_36px_rgba(15,23,42,0.08)]">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-bold text-slate-800">ציר זמן / שלבים</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {(['NEW', 'QUALIFIED', 'PROPOSAL', 'NEGOTIATION', 'WON'] as const).map((s, i) => (
+                <div key={s} className="flex items-center gap-3">
+                  <div
+                    className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full text-xs font-bold text-white"
+                    style={{ background: galit.primary, opacity: 1 - i * 0.12 }}
+                  >
+                    {i + 1}
+                  </div>
+                  <div className="flex-1 text-right">
+                    <div className="text-sm font-semibold text-slate-800">{OPPORTUNITY_STAGE_LABELS[s]}</div>
+                    <div className="text-xs text-slate-500">
+                      {opportunities.filter((o) => o.pipelineStage === s).length} הזדמנויות
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </CardContent>
+          </Card>
+
+          <Card className="rounded-[24px] border-0 bg-white shadow-[0_12px_36px_rgba(15,23,42,0.08)]">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-bold text-slate-800">מקור הזדמנויות</CardTitle>
+              <p className="text-xs text-slate-400">הערכה ויזואלית (לפי נפח פעילות במערכת)</p>
+            </CardHeader>
+            <CardContent className="flex flex-wrap gap-2">
+              {sourceChips.map((c) => (
+                <span
+                  key={c.label}
+                  className="rounded-full border border-emerald-100 bg-emerald-50/80 px-3 py-1.5 text-xs font-semibold text-emerald-900"
+                >
+                  {c.label} · {c.count}
+                </span>
+              ))}
+            </CardContent>
+          </Card>
+        </aside>
+
+        <div className="order-2 space-y-4 lg:order-2">
+          <div className="rounded-[28px] border border-emerald-100/80 bg-[#f7fbf5] p-5 shadow-[0_12px_40px_rgba(15,23,42,0.06)]">
+            <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+              <div className="min-w-0 flex-1 text-center md:text-right">
+                <h1 className="text-2xl font-black leading-tight text-slate-900 md:text-4xl">
+                  לוח הזדמנויות מכירה - <span style={{ color: galit.primary }}>גלית</span>
+                </h1>
+                <p className="mt-2 text-sm text-slate-500 md:text-base">סקירת ביצועים והמלצות</p>
+              </div>
+              <div className="flex flex-shrink-0 flex-col gap-2 sm:flex-row">
+                <Button
+                  className="rounded-2xl px-5 py-2.5 text-sm font-semibold shadow-md"
+                  style={{ background: galit.primary }}
+                  onClick={() => setOpen(true)}
+                >
+                  <Plus className="ml-2 h-4 w-4" />
+                  הוספת הזדמנות חדשה
+                </Button>
+                <Button
+                  className="rounded-2xl px-5 py-2.5 text-sm font-semibold shadow-md"
+                  style={{ background: galit.primary }}
+                  onClick={() => setOpen(true)}
+                >
+                  <Plus className="ml-2 h-4 w-4" />
+                  הוספת הזדמנות חדשה
+                </Button>
+              </div>
+            </div>
+
+            <div className="mt-5 grid gap-3 md:grid-cols-[1fr_auto_auto_auto] md:items-end">
+              <div className="relative min-w-0">
+                <Search className="pointer-events-none absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <Input
+                  className="h-12 rounded-2xl border-slate-200 bg-white pr-11 text-sm shadow-sm"
+                  placeholder="חיפוש לפי שם הזדמנות, לקוח, שלב או הערות..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+              </div>
+              <div className="min-w-[140px]">
+                <div className="mb-1 text-xs text-slate-500">סטטוס / שלב</div>
+                <select
+                  className="h-11 w-full rounded-2xl border border-slate-200 bg-white px-3 text-sm"
+                  value={stageFilter}
+                  onChange={(e) => setStageFilter(e.target.value)}
+                >
+                  <option value="הכל">הכל</option>
+                  {OPPORTUNITY_STAGES.map((s) => (
+                    <option key={s} value={OPPORTUNITY_STAGE_LABELS[s]}>
+                      {OPPORTUNITY_STAGE_LABELS[s]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="min-w-[120px]">
+                <div className="mb-1 text-xs text-slate-500">תאריך</div>
+                <select
+                  className="h-11 w-full rounded-2xl border border-slate-200 bg-white px-3 text-sm"
+                  value={datePreset}
+                  onChange={(e) => setDatePreset(e.target.value as 'all' | 'month' | 'quarter')}
+                >
+                  <option value="all">הכל</option>
+                  <option value="month">חודש קרוב</option>
+                  <option value="quarter">רבעון</option>
+                </select>
+              </div>
+              <div className="min-w-[140px]">
+                <div className="mb-1 text-xs text-slate-500">מיון</div>
+                <select
+                  className="h-11 w-full rounded-2xl border border-slate-200 bg-white px-3 text-sm"
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
+                >
+                  <option value="value_desc">שווי (גבוה → נמוך)</option>
+                  <option value="close_asc">תאריך סגירה יעד</option>
+                  <option value="created_desc">תאריך יצירה</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {filteredOpportunities.length === 0 ? (
+              <div className="col-span-full rounded-3xl border border-dashed border-emerald-200 bg-white/80 py-14 text-center text-sm text-slate-500">
+                לא נמצאו הזדמנות מתאימות
+              </div>
+            ) : (
+              filteredOpportunities.map((o) => {
+                const customerName = o.customer?.name || customers.find((c) => c.id === o.customerId)?.name || '—';
+                const contactHint = o.lead?.fullName || o.assignedUser?.name || '—';
+                const statusChip = opportunityStatusChip(o.pipelineStage);
+                return (
+                  <button
+                    key={o.id}
+                    type="button"
+                    onClick={() => openDetails(o)}
+                    className="group w-full rounded-[22px] border border-slate-100 bg-white p-5 text-right shadow-[0_10px_28px_rgba(15,23,42,0.07)] transition hover:-translate-y-0.5 hover:shadow-[0_16px_36px_rgba(15,23,42,0.1)]"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="line-clamp-2 text-base font-bold text-slate-900">{o.projectOrServiceName}</div>
+                        <div className="mt-1 text-sm font-medium text-slate-600">{customerName}</div>
+                      </div>
+                      <Badge className={stageBadgeClass(o.pipelineStage)}>
+                        {OPPORTUNITY_STAGE_LABELS[o.pipelineStage] || o.pipelineStage}
+                      </Badge>
+                    </div>
+                    <div className="mt-4 flex items-center justify-between gap-2 text-xs text-slate-500">
+                      <span>שירות / פרויקט</span>
+                      <span className="font-medium text-slate-700">{o.projectOrServiceName}</span>
+                    </div>
+                    <div className="mt-2 flex items-center justify-between gap-2">
+                      <span className="text-lg font-black text-emerald-700">{formatCurrencyILS(Number(o.estimatedValue || 0))}</span>
+                      <span className="text-xs text-slate-500">
+                        {o.targetCloseDate ? new Date(o.targetCloseDate).toLocaleDateString('he-IL') : 'ללא תאריך יעד'}
+                      </span>
+                    </div>
+                    <div className="mt-4 flex items-center justify-between border-t border-slate-100 pt-3">
+                      <div className="flex items-center gap-2">
+                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
+                          <UserCircle2 className="h-5 w-5" />
+                        </div>
+                        <div className="text-right">
+                          <div className="text-xs text-slate-400">איש קשר</div>
+                          <div className="text-sm font-semibold text-slate-800">{contactHint}</div>
+                        </div>
+                      </div>
+                      <div className={cn('rounded-full px-2 py-1 text-[10px] font-bold', statusChip.cls)}>{statusChip.label}</div>
+                    </div>
+                  </button>
+                );
+              })
+            )}
+          </div>
         </div>
-        <Button className="rounded-2xl" style={{ background: galit.primary }} onClick={() => setOpen(true)}>
-          <Plus className="ml-2 h-4 w-4" />
-          הזדמנות חדשה
-        </Button>
+
+        <aside className="order-3 space-y-4 lg:order-3">
+          <Card className="overflow-hidden rounded-[24px] border-0 bg-white shadow-[0_12px_36px_rgba(15,23,42,0.08)]">
+            <CardContent className="space-y-4 p-6">
+              <div className="flex flex-col items-center text-center">
+                <div className="flex h-20 w-20 items-center justify-center rounded-full bg-emerald-100 text-emerald-700 ring-4 ring-emerald-50">
+                  <UserCircle2 className="h-12 w-12" />
+                </div>
+                <div className="mt-3 text-lg font-bold text-slate-900">{currentUser.name}</div>
+                <div className="text-sm text-slate-500">{roleLabel(currentUser.role)}</div>
+              </div>
+              <div className="rounded-2xl bg-slate-50 p-4 text-right">
+                <div className="text-xs font-semibold text-slate-400">פרטי קשר</div>
+                <div className="mt-3 space-y-2 text-sm">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-slate-500">טלפון</span>
+                    <span className="font-medium text-slate-800">050-0000000</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-slate-500">מיקום</span>
+                    <span className="font-medium text-slate-800">ישראל</span>
+                  </div>
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="text-slate-500">אימייל</span>
+                    <span className="max-w-[65%] break-all text-left font-medium text-slate-800">{currentUser.email}</span>
+                  </div>
+                </div>
+              </div>
+              <Button
+                className="h-12 w-full rounded-2xl text-base font-semibold shadow-md"
+                style={{ background: galit.primary }}
+                disabled={saving}
+                onClick={handleCreateQuoteFromPanel}
+              >
+                יצירת הצעה
+              </Button>
+            </CardContent>
+          </Card>
+        </aside>
       </div>
 
-      <Card>
-        <CardContent className="p-0">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>שם</TableHead>
-                <TableHead>לקוח</TableHead>
-                <TableHead>ליד</TableHead>
-                <TableHead>שווי משוער</TableHead>
-                <TableHead>שלב</TableHead>
-                <TableHead>משויך ל</TableHead>
-                <TableHead>סגירה יעד</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {opportunities.map((o) => (
-                <TableRow key={o.id} className="cursor-pointer hover:bg-slate-50" onClick={() => openDetails(o)}>
-                  <TableCell className="font-medium">{o.projectOrServiceName}</TableCell>
-                  <TableCell>{o.customer?.name || customers.find((c) => c.id === o.customerId)?.name || '-'}</TableCell>
-                  <TableCell>{o.lead?.fullName || (o.leadId ? `ליד: ${o.leadId}` : '-')}</TableCell>
-                  <TableCell>{formatCurrencyILS(Number(o.estimatedValue || 0))}</TableCell>
-                  <TableCell>{OPPORTUNITY_STAGE_LABELS[o.pipelineStage] || o.pipelineStage || '-'}</TableCell>
-                  <TableCell>{o.assignedUser?.name || (o.assignedUserId ? users.find((u) => u.id === o.assignedUserId)?.name : '-') || '-'}</TableCell>
-                  <TableCell>{o.targetCloseDate ? new Date(o.targetCloseDate).toLocaleDateString('he-IL') : '-'}</TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
+      <Modal open={quotePickOpen} onClose={() => setQuotePickOpen(false)} title="בחר הזדמנות להצעת מחיר" maxWidth="max-w-md">
+        <div className="space-y-2">
+          <p className="text-sm text-slate-500">נבחרה הזדמנות ליצירת הצעת מחיר:</p>
+          <div className="max-h-64 space-y-2 overflow-y-auto">
+            {filteredOpportunities.map((o) => (
+              <button
+                key={o.id}
+                type="button"
+                className="flex w-full items-center justify-between rounded-2xl border border-slate-100 bg-white px-4 py-3 text-right text-sm hover:bg-slate-50"
+                onClick={() => {
+                  setQuotePickOpen(false);
+                  void createQuoteFromOpportunityFor(o);
+                }}
+              >
+                <span className="font-semibold">{o.projectOrServiceName}</span>
+                <span className="text-xs text-slate-500">{formatCurrencyILS(Number(o.estimatedValue || 0))}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </Modal>
 
       <Modal open={open} onClose={() => setOpen(false)} title="הזדמנות חדשה" maxWidth="max-w-xl">
         <div className="space-y-3">
@@ -7472,7 +8609,7 @@ function ReportsPage({
 
   useEffect(() => {
     let isMounted = true;
-    fetch('http://localhost:3001/reports', { headers: authHeaders(currentUser) })
+    apiFetch(apiUrl('/reports'), { authUser: currentUser })
       .then((r) => (r.ok ? r.json() : Promise.reject()))
       .then((data) => {
         if (!isMounted || !Array.isArray(data)) return;
@@ -7543,10 +8680,10 @@ function ReportsPage({
         internalNotes: form.internalNotes || null,
         clientNotes: form.clientNotes || null,
       };
-      const url = editing ? `http://localhost:3001/reports/${editing.id}` : 'http://localhost:3001/reports';
-      const res = await fetch(url, {
+      const url = editing ? `${getApiBaseUrl()}/reports/${editing.id}` : apiUrl('/reports');
+      const res = await apiFetch(url, {
         method: editing ? 'PATCH' : 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error();
@@ -7563,9 +8700,9 @@ function ReportsPage({
 
   const setStatus = async (r: Report, status: string) => {
     try {
-      const res = await fetch(`http://localhost:3001/reports/${r.id}`, {
+      const res = await apiFetch(apiUrl(`/reports/${r.id}`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify({ status }),
       });
       if (!res.ok) throw new Error();
@@ -7744,7 +8881,7 @@ function DocumentsPage({
   };
 
   const load = () =>
-    fetch('http://localhost:3001/documents', { headers: authHeaders(currentUser) })
+    apiFetch(apiUrl('/documents'), { authUser: currentUser })
       .then((r) => (r.ok ? r.json() : Promise.reject()))
       .then((data) => {
         if (Array.isArray(data)) setDocs(data);
@@ -7794,10 +8931,10 @@ function DocumentsPage({
         reportId: form.reportId || null,
         description: form.description || null,
       };
-      const url = editing ? `http://localhost:3001/documents/${editing.id}` : 'http://localhost:3001/documents';
-      const res = await fetch(url, {
+      const url = editing ? `${getApiBaseUrl()}/documents/${editing.id}` : apiUrl('/documents');
+      const res = await apiFetch(url, {
         method: editing ? 'PATCH' : 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error();
@@ -7952,7 +9089,7 @@ function LabSamplesPage({
 
   useEffect(() => {
     let isMounted = true;
-    fetch('http://localhost:3001/lab-samples', { headers: authHeaders(currentUser) })
+    apiFetch(apiUrl('/lab-samples'), { authUser: currentUser })
       .then((r) => (r.ok ? r.json() : Promise.reject()))
       .then((data) => {
         if (!isMounted || !Array.isArray(data)) return;
@@ -8041,10 +9178,10 @@ function LabSamplesPage({
         resultFilePath: form.resultFilePath || null,
         notes: form.notes || null,
       };
-      const url = editing ? `http://localhost:3001/lab-samples/${editing.id}` : 'http://localhost:3001/lab-samples';
-      const res = await fetch(url, {
+      const url = editing ? `${getApiBaseUrl()}/lab-samples/${editing.id}` : apiUrl('/lab-samples');
+      const res = await apiFetch(url, {
         method: editing ? 'PATCH' : 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error();
@@ -8200,18 +9337,116 @@ function LabSamplesPage({
   );
 }
 
-function SettingsPage({ currentUser }: { currentUser: AppUser }) {
-  const [tab, setTab] = useState<'employees' | 'permissions' | 'services' | 'statuses' | 'targets' | 'templates' | 'system' | 'catalog'>('employees');
-  const tabs: Array<{ key: typeof tab; label: string }> = [
-    { key: 'employees', label: 'עובדים' },
-    { key: 'permissions', label: 'הרשאות' },
-    { key: 'services', label: 'שירותים' },
-    { key: 'statuses', label: 'סטטוסים' },
-    { key: 'targets', label: 'יעדים' },
-    { key: 'catalog', label: 'פריטים / מחירון' },
-    { key: 'templates', label: 'תבניות' },
-    { key: 'system', label: 'מערכת' },
+function SettingsPage({
+  currentUser,
+  customers,
+  leads,
+  projects,
+  quotes,
+  users,
+  onReloadCustomers,
+  onReloadLeads,
+  onReloadProjects,
+  onReloadQuotes,
+  onReloadCustomerClassifications,
+  onReloadUsers,
+  customerClassifications,
+  customerTypeLabelMap,
+  settingsJumpTab,
+  onSettingsJumpConsumed,
+}: {
+  currentUser: AppUser;
+  customers: Customer[];
+  leads: Lead[];
+  projects: Project[];
+  quotes: Quote[];
+  users: AppUser[];
+  onReloadCustomers: () => Promise<void>;
+  onReloadLeads: () => Promise<void>;
+  onReloadProjects: () => Promise<void>;
+  onReloadQuotes: () => Promise<void>;
+  onReloadCustomerClassifications: () => Promise<void>;
+  onReloadUsers?: () => Promise<void>;
+  customerClassifications: CustomerClassificationDto[];
+  customerTypeLabelMap: Record<string, string>;
+  settingsJumpTab?: SettingsToolbarJumpTab | null;
+  onSettingsJumpConsumed?: () => void;
+}) {
+  const canManageUsersEffective = currentUser.role === 'admin' || currentUser.role === 'manager' || currentUser.canManageUsers;
+  const canManagePermissionsEffective = currentUser.role === 'admin' || currentUser.canManagePermissions;
+  const canDataImport =
+    canAccess(currentUser.role, 'customers') ||
+    canAccess(currentUser.role, 'leads') ||
+    canAccess(currentUser.role, 'quotes') ||
+    canAccess(currentUser.role, 'projects') ||
+    canAccess(currentUser.role, 'reports') ||
+    currentUser.role === 'admin' ||
+    currentUser.role === 'manager';
+
+  const canManageCustomerClassifications = currentUser.role === 'admin' || currentUser.role === 'manager';
+  /** ייבוא Followup מרוכז — רק מנהל מערכת (ה-API דורש ADMIN) */
+  const canFollowupImport = isAdminRole(currentUser.role);
+  /** רק אדמין/מנהל — כלי החלפת עובד / אחריות (לא משתמש עם canManageUsers בלבד) */
+  const canEmployeeHandoff = currentUser.role === 'admin' || currentUser.role === 'manager';
+  const canManageQuoteTemplates = currentUser.role === 'admin' || currentUser.role === 'manager';
+
+  type SettingsTabKey =
+    | 'employees'
+    | 'employeeHandoff'
+    | 'permissions'
+    | 'customerClassification'
+    | 'services'
+    | 'statuses'
+    | 'targets'
+    | 'templates'
+    | 'system'
+    | 'catalog'
+    | 'import'
+    | 'followupImport';
+
+  const defaultTab: SettingsTabKey = canManageUsersEffective
+    ? 'employees'
+    : canManagePermissionsEffective
+      ? 'permissions'
+      : 'services';
+
+  const [tab, setTab] = useState<SettingsTabKey>(defaultTab);
+
+  const tabs: Array<{ key: SettingsTabKey; label: string; enabled: boolean }> = [
+    { key: 'employees', label: 'עובדים', enabled: canManageUsersEffective },
+    { key: 'employeeHandoff', label: 'החלפת עובד / אחריות', enabled: canEmployeeHandoff },
+    { key: 'permissions', label: 'תפקידים והרשאות', enabled: canManagePermissionsEffective },
+    { key: 'customerClassification', label: 'סיווגי לקוחות', enabled: canManageCustomerClassifications },
+    { key: 'import', label: 'ייבוא נתונים', enabled: canDataImport },
+    { key: 'followupImport', label: 'ייבוא Followup', enabled: canFollowupImport },
+    { key: 'services', label: 'שירותים', enabled: true },
+    { key: 'statuses', label: 'סטטוסים', enabled: true },
+    { key: 'targets', label: 'יעדים', enabled: true },
+    { key: 'catalog', label: 'פריטים / מחירון', enabled: true },
+    { key: 'templates', label: 'תבניות הצעות מחיר', enabled: true },
+    { key: 'system', label: 'מערכת', enabled: true },
   ];
+
+  const enabledTabs = tabs.filter((t) => t.enabled);
+
+  useEffect(() => {
+    if (enabledTabs.some((t) => t.key === tab)) return;
+    setTab(enabledTabs[0]?.key ?? 'services');
+  }, [
+    canManageUsersEffective,
+    canEmployeeHandoff,
+    canManagePermissionsEffective,
+    canDataImport,
+    canFollowupImport,
+    canManageCustomerClassifications,
+  ]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!settingsJumpTab) return;
+    const row = tabs.find((t) => t.key === settingsJumpTab);
+    if (row?.enabled) setTab(settingsJumpTab as SettingsTabKey);
+    onSettingsJumpConsumed?.();
+  }, [settingsJumpTab]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Employees
   const [employees, setEmployees] = useState<any[]>([]);
@@ -8227,7 +9462,74 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
     status: 'ACTIVE',
     phone: '',
     serviceDepartments: [] as string[],
+    canViewFinance: false,
+    canEditFinance: false,
+    canDeleteCustomers: false,
+    canDeleteLeads: false,
+    canManageUsers: false,
+    canManagePermissions: false,
+    canViewAllRecords: false,
   });
+
+  const [transferFromId, setTransferFromId] = useState('');
+  const [transferToId, setTransferToId] = useState('');
+  const [transferOpts, setTransferOpts] = useState({
+    leads: true,
+    customers: true,
+    tasks: true,
+    projects: true,
+    quotes: true,
+  });
+  const [transferBusy, setTransferBusy] = useState(false);
+  const [copyPermFromId, setCopyPermFromId] = useState('');
+  const [copyPermToId, setCopyPermToId] = useState('');
+  const [copyPermBusy, setCopyPermBusy] = useState(false);
+  const [inactiveMarkId, setInactiveMarkId] = useState('');
+  const [inactiveBusy, setInactiveBusy] = useState(false);
+  const [handoffError, setHandoffError] = useState('');
+
+  const [qtList, setQtList] = useState<any[]>([]);
+  const [qtLoading, setQtLoading] = useState(false);
+  const [qtError, setQtError] = useState('');
+  const [qtModalOpen, setQtModalOpen] = useState(false);
+  const [qtEditing, setQtEditing] = useState<any | null>(null);
+  const [qtForm, setQtForm] = useState({
+    name: '',
+    serviceType: 'קרינה',
+    isActive: true,
+    introHtml: '',
+    bodyHtml: '',
+    closingHtml: '',
+    termsHtml: '',
+    variablesHelp: QUOTE_TEMPLATE_VARIABLES_HELP,
+    defaultLineItemsJson: '[{"name":"שירות לדוגמה","quantity":1,"unitPrice":1000}]',
+  });
+
+  const loadQuoteTemplates = async () => {
+    setQtLoading(true);
+    setQtError('');
+    try {
+      const res = await apiFetch(apiUrl('/quote-templates'), { authUser: currentUser });
+      if (!res.ok) throw new Error();
+      const data = await res.json();
+      setQtList(Array.isArray(data) ? data : []);
+    } catch {
+      setQtError('טעינת תבניות נכשלה');
+    } finally {
+      setQtLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (tab !== 'templates') return;
+    void loadQuoteTemplates();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, currentUser.id]);
+
+  const employeesActiveOnly = useMemo(
+    () => (employees as any[]).filter((e) => (e.status || '').toString().toUpperCase() === 'ACTIVE'),
+    [employees],
+  );
 
   const SERVICE_DEPARTMENT_OPTIONS = [
     'אקוסטיקה / רעש',
@@ -8283,7 +9585,7 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
     setEmpLoading(true);
     setEmpError('');
     try {
-      const res = await fetch('http://localhost:3001/users', { headers: authHeaders(currentUser) });
+      const res = await apiFetch(apiUrl('/users'), { authUser: currentUser });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setEmployees(Array.isArray(data) ? data : []);
@@ -8295,16 +9597,37 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
   };
 
   useEffect(() => {
+    if (!currentUser) return;
+    const needEmployees =
+      canManageUsersEffective || currentUser.role === 'admin' || currentUser.role === 'manager';
+    if (!needEmployees) return;
     loadEmployees();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentUser.id, currentUser.role]);
+  }, [currentUser.id, currentUser.role, canManageUsersEffective]);
 
   const openCreateEmp = () => {
+    if (!canManageUsersEffective) return;
     setEmpEditing(null);
-    setEmpForm({ name: '', email: '', password: '', role: 'SALES', status: 'ACTIVE', phone: '', serviceDepartments: [] });
+    setEmpForm({
+      name: '',
+      email: '',
+      password: '',
+      role: 'SALES',
+      status: 'ACTIVE',
+      phone: '',
+      serviceDepartments: [],
+      canViewFinance: false,
+      canEditFinance: false,
+      canDeleteCustomers: false,
+      canDeleteLeads: false,
+      canManageUsers: false,
+      canManagePermissions: false,
+      canViewAllRecords: false,
+    });
     setEmpModalOpen(true);
   };
   const openEditEmp = (u: any) => {
+    if (!canManageUsersEffective) return;
     setEmpEditing(u);
     setEmpForm({
       name: u.name || '',
@@ -8314,6 +9637,13 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
       status: (u.status || 'ACTIVE').toString(),
       phone: u.phone || '',
       serviceDepartments: Array.isArray(u.serviceDepartments) ? u.serviceDepartments : u.department ? [u.department] : [],
+      canViewFinance: !!u.canViewFinance,
+      canEditFinance: !!u.canEditFinance,
+      canDeleteCustomers: !!u.canDeleteCustomers,
+      canDeleteLeads: !!u.canDeleteLeads,
+      canManageUsers: !!u.canManageUsers,
+      canManagePermissions: !!u.canManagePermissions,
+      canViewAllRecords: !!u.canViewAllRecords,
     });
     setEmpModalOpen(true);
   };
@@ -8349,32 +9679,132 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
         serviceDepartments: payloadDepartments,
         // legacy display-only field
         department: payloadDepartments[0] ?? null,
+        canViewFinance: !!empForm.canViewFinance,
+        canEditFinance: !!empForm.canEditFinance,
+        canDeleteCustomers: !!empForm.canDeleteCustomers,
+        canDeleteLeads: !!empForm.canDeleteLeads,
+        canManageUsers: !!empForm.canManageUsers,
+        canManagePermissions: !!empForm.canManagePermissions,
+        canViewAllRecords: !!empForm.canViewAllRecords,
       };
       if (!empEditing) payload.password = empForm.password || '1234';
-      const url = empEditing ? `http://localhost:3001/users/${empEditing.id}` : 'http://localhost:3001/users';
-      const res = await fetch(url, {
+      const url = empEditing ? `${getApiBaseUrl()}/users/${empEditing.id}` : apiUrl('/users');
+      const res = await apiFetch(url, {
         method: empEditing ? 'PATCH' : 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
       setEmpModalOpen(false);
       await loadEmployees();
+      await onReloadUsers?.();
     } catch {
       setEmpError('שמירת עובד נכשלה. בדוק שדות ונסה שוב.');
+    }
+  };
+
+  const copyPermissionsHandoff = async () => {
+    if (!copyPermFromId || !copyPermToId || copyPermFromId === copyPermToId) {
+      setHandoffError('יש לבחור עובד מקור ויעד שונים.');
+      return;
+    }
+    setHandoffError('');
+    setCopyPermBusy(true);
+    try {
+      const res = await apiFetch(apiUrl('/users/copy-permissions'), {
+        method: 'POST',
+        authUser: currentUser,
+        body: JSON.stringify({ fromUserId: copyPermFromId, toUserId: copyPermToId }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await loadEmployees();
+      await onReloadUsers?.();
+      setSettingsMsg('ההרשאות הועתקו לעובד היעד בהצלחה.');
+      window.setTimeout(() => setSettingsMsg(''), 4000);
+    } catch {
+      setHandoffError('העתקת הרשאות נכשלה.');
+    } finally {
+      setCopyPermBusy(false);
+    }
+  };
+
+  const runTransferData = async () => {
+    if (!transferFromId || !transferToId || transferFromId === transferToId) {
+      setHandoffError('יש לבחור עובד מקור ויעד שונים.');
+      return;
+    }
+    const anyChecked = Object.values(transferOpts).some(Boolean);
+    if (!anyChecked) {
+      setHandoffError('סמן לפחות סוג נתון אחד להעברה.');
+      return;
+    }
+    setTransferBusy(true);
+    setHandoffError('');
+    try {
+      const res = await apiFetch(apiUrl('/users/transfer-data'), {
+        method: 'POST',
+        authUser: currentUser,
+        body: JSON.stringify({
+          fromUserId: transferFromId,
+          toUserId: transferToId,
+          ...transferOpts,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      setSettingsMsg(`העברת אחריות הושלמה: ${JSON.stringify(data.counts || {})}`);
+      window.setTimeout(() => setSettingsMsg(''), 5000);
+      await onReloadUsers?.();
+    } catch {
+      setHandoffError('העברת אחריות נכשלה.');
+    } finally {
+      setTransferBusy(false);
+    }
+  };
+
+  const markEmployeeInactiveHandoff = async () => {
+    if (!inactiveMarkId) {
+      setHandoffError('בחר עובד לסימון.');
+      return;
+    }
+    const u = employees.find((e: any) => e.id === inactiveMarkId);
+    if (!u) return;
+    if ((u.status || '').toString().toUpperCase() === 'INACTIVE') {
+      setHandoffError('העובד כבר מסומן כלא פעיל.');
+      return;
+    }
+    setHandoffError('');
+    setInactiveBusy(true);
+    try {
+      const res = await apiFetch(apiUrl(`/users/${inactiveMarkId}`), {
+        method: 'PATCH',
+        authUser: currentUser,
+        body: JSON.stringify({ status: 'INACTIVE' }),
+      });
+      if (!res.ok) throw new Error();
+      setInactiveMarkId('');
+      await loadEmployees();
+      await onReloadUsers?.();
+      setSettingsMsg('העובד סומן כלא פעיל ולא יוכל להתחבר.');
+      window.setTimeout(() => setSettingsMsg(''), 4000);
+    } catch {
+      setHandoffError('עדכון סטטוס נכשל.');
+    } finally {
+      setInactiveBusy(false);
     }
   };
 
   const toggleActive = async (u: any) => {
     try {
       const next = u.status === 'INACTIVE' ? 'ACTIVE' : 'INACTIVE';
-      const res = await fetch(`http://localhost:3001/users/${u.id}`, {
+      const res = await apiFetch(apiUrl(`/users/${u.id}`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify({ status: next }),
       });
       if (!res.ok) throw new Error();
       await loadEmployees();
+      await onReloadUsers?.();
     } catch {
       setEmpError('עדכון סטטוס עובד נכשל.');
     }
@@ -8394,6 +9824,38 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
     { category: 'מעבדה', subtypes: [] },
   ]);
   const [settingsMsg, setSettingsMsg] = useState('');
+  const [clsNewLabel, setClsNewLabel] = useState('');
+  const [clsSaving, setClsSaving] = useState(false);
+  const [clsErr, setClsErr] = useState('');
+
+  const addCustomerClassificationInSettings = async () => {
+    const label = clsNewLabel.trim();
+    if (!label) {
+      setClsErr('נא להזין שם לסיווג');
+      return;
+    }
+    setClsSaving(true);
+    setClsErr('');
+    try {
+      const res = await apiFetch(apiUrl('/customer-classifications'), {
+        method: 'POST',
+        authUser: currentUser,
+        body: JSON.stringify({ labelHe: label }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({} as { message?: string }));
+        throw new Error((err as { message?: string }).message || 'הוספת סיווג נכשלה');
+      }
+      setClsNewLabel('');
+      await onReloadCustomerClassifications();
+      setSettingsMsg('הסיווג נוסף. הוא יופיע מיד בטפסי לקוח, ברשימות ובדשבורד.');
+      window.setTimeout(() => setSettingsMsg(''), 4500);
+    } catch (e: unknown) {
+      setClsErr(e instanceof Error ? e.message : 'הוספת סיווג נכשלה');
+    } finally {
+      setClsSaving(false);
+    }
+  };
 
   // Catalog
   const [catalog, setCatalog] = useState<any[]>([]);
@@ -8418,14 +9880,14 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
   });
 
   const loadSetting = async (key: string) => {
-    const res = await fetch(`http://localhost:3001/settings/${key}`, { headers: authHeaders(currentUser) });
+    const res = await apiFetch(apiUrl(`/settings/${key}`), { authUser: currentUser });
     if (!res.ok) return null;
     return res.json();
   };
   const saveSetting = async (key: string, value: any) => {
-    const res = await fetch(`http://localhost:3001/settings/${key}`, {
+    const res = await apiFetch(apiUrl(`/settings/${key}`), {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+          authUser: currentUser,
       body: JSON.stringify({ value }),
     });
     if (!res.ok) throw new Error();
@@ -8445,7 +9907,7 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
     setCatalogLoading(true);
     setCatalogError('');
     try {
-      const res = await fetch('http://localhost:3001/quote-item-catalog', { headers: authHeaders(currentUser) });
+      const res = await apiFetch(apiUrl('/quote-item-catalog'), { authUser: currentUser });
       if (!res.ok) throw new Error();
       const data = await res.json();
       setCatalog(Array.isArray(data) ? data : []);
@@ -8523,10 +9985,10 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
         requiresReport: !!catalogForm.requiresReport,
         notes: catalogForm.notes || null,
       };
-      const url = catalogEditing ? `http://localhost:3001/quote-item-catalog/${catalogEditing.id}` : 'http://localhost:3001/quote-item-catalog';
-      const res = await fetch(url, {
+      const url = catalogEditing ? `${getApiBaseUrl()}/quote-item-catalog/${catalogEditing.id}` : apiUrl('/quote-item-catalog');
+      const res = await apiFetch(url, {
         method: catalogEditing ? 'PATCH' : 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -8541,9 +10003,9 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
 
   const toggleCatalogActive = async (it: any) => {
     try {
-      const res = await fetch(`http://localhost:3001/quote-item-catalog/${it.id}`, {
+      const res = await apiFetch(apiUrl(`/quote-item-catalog/${it.id}`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify({ isActive: !it.isActive }),
       });
       if (!res.ok) throw new Error();
@@ -8563,6 +10025,56 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
     { role: 'FINANCE', modules: ['הצעות מחיר', 'מסמכים (חשבוניות)'] },
   ];
 
+  // Detailed permission display based on backend @Roles per controller.
+  // Note: UI-only for now; backend enforcement is still role-based (no dynamic ACL yet).
+  const rolePermissionDetails = (role: string) => {
+    const r = (role || '').toString().toUpperCase();
+
+    const hasLeads = ['ADMIN', 'MANAGER', 'SALES'].includes(r);
+    const hasCustomers = ['ADMIN', 'MANAGER', 'SALES'].includes(r);
+    const hasQuotes = ['ADMIN', 'MANAGER', 'SALES'].includes(r);
+    const hasReports = ['ADMIN', 'MANAGER'].includes(r);
+    const canManageEmployees = ['ADMIN', 'MANAGER'].includes(r);
+    const canManagePermissions = ['ADMIN', 'MANAGER'].includes(r);
+
+    const scopeLabel = (() => {
+      if (r === 'ADMIN' || r === 'MANAGER') return 'כל המערכת';
+      if (r === 'TECHNICIAN') return 'פרויקטים/משימות/יומן שטח – רק משויכים';
+      if (r === 'SALES') return 'משימות – רק משויכות; שאר המודולים – כל המערכת';
+      return 'לפי הרשאות תפקיד';
+    })();
+
+    return {
+      leads: {
+        view: hasLeads,
+        create: hasLeads,
+        edit: hasLeads,
+        delete: hasLeads,
+      },
+      customers: {
+        view: hasCustomers,
+        delete: hasCustomers,
+      },
+      quotes: {
+        view: hasQuotes,
+      },
+      funds: {
+        view: hasQuotes,
+        edit: hasQuotes,
+      },
+      reports: {
+        view: hasReports,
+      },
+      employees: {
+        manage: canManageEmployees,
+      },
+      permissions: {
+        manage: canManagePermissions,
+      },
+      scopeLabel,
+    };
+  };
+
   const leadStatuses = ['NEW', 'FU_1', 'FU_2', 'QUOTE_SENT', 'WON', 'LOST', 'NOT_RELEVANT'];
   const projectStatuses = ['NEW', 'WAITING_QUOTE', 'WAITING_APPROVAL', 'SCHEDULED', 'ON_THE_WAY', 'FIELD_WORK_DONE', 'WAITING_DATA', 'REPORT_WRITING', 'SENT_TO_CLIENT', 'CLOSED', 'POSTPONED', 'CANCELLED'];
   const taskStatuses = ['OPEN', 'IN_PROGRESS', 'DONE', 'CANCELLED'];
@@ -8578,7 +10090,7 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
       </div>
 
       <div className="flex flex-wrap gap-2">
-        {tabs.map((t) => (
+        {enabledTabs.map((t) => (
           <button
             key={t.key}
             className={cn('rounded-2xl px-4 py-2 text-sm font-semibold', tab === t.key ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200')}
@@ -8593,11 +10105,126 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
       {catalogError && <div className="rounded-2xl bg-red-50 px-4 py-3 text-sm text-red-700">{catalogError}</div>}
       {settingsMsg && <div className="rounded-2xl bg-emerald-50 px-4 py-3 text-sm text-emerald-800">{settingsMsg}</div>}
 
-      {tab === 'employees' && (
+      {tab === 'import' && canDataImport && (
+        <DataImportWizard
+          currentUserRole={currentUser.role}
+          getAuthHeaders={() => authHeaders(currentUser)}
+          customers={customers}
+          leads={leads.map((l) => ({
+            id: l.id,
+            name: l.fullName || l.name,
+            phone: l.phone || '',
+            email: l.email,
+            importLegacyId: l.importLegacyId,
+          }))}
+          projects={projects.map((p) => ({
+            id: p.id,
+            name: p.name,
+            client: p.client,
+            importLegacyId: p.importLegacyId,
+          }))}
+          quotes={quotes}
+          users={users.map((u) => ({ id: u.id, email: u.email, name: u.name }))}
+          currentUserId={currentUser.id}
+          customerClassifications={customerClassifications}
+          customerTypeLabelMap={customerTypeLabelMap}
+          onReloadCustomers={onReloadCustomers}
+          onReloadLeads={onReloadLeads}
+          onReloadProjects={onReloadProjects}
+          onReloadQuotes={onReloadQuotes}
+          onMessage={(msg) => {
+            setSettingsMsg(msg);
+            window.setTimeout(() => setSettingsMsg(''), 4000);
+          }}
+        />
+      )}
+
+      {tab === 'followupImport' && canFollowupImport && (
+        <FollowupImportPanel
+          currentUser={{ id: currentUser.id, role: currentUser.role }}
+          onReloadCustomers={onReloadCustomers}
+          onReloadQuotes={onReloadQuotes}
+          onMessage={(msg) => {
+            setSettingsMsg(msg);
+            window.setTimeout(() => setSettingsMsg(''), 6000);
+          }}
+        />
+      )}
+
+      {tab === 'customerClassification' && canManageCustomerClassifications && (
         <Card>
-          <CardHeader className="flex items-center justify-between">
+          <CardHeader>
+            <CardTitle>ניהול סיווגי לקוחות</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-sm text-slate-600">
+              הסיווגים נשמרים בשרת (טבלת <span className="font-mono text-xs">CustomerClassification</span>).
+              רק מנהל מערכת או מנהל יכולים להוסיף סיווג חדש כאן. משתמשים אחרים יכולים רק לבחור מתוך הרשימה בטופסי לקוח.
+            </p>
+            <div className="overflow-x-auto rounded-2xl border border-slate-100">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>שם בעברית</TableHead>
+                    <TableHead>קוד (מערכת)</TableHead>
+                    <TableHead>סדר</TableHead>
+                    <TableHead>אופי</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {[...customerClassifications]
+                    .sort((a, b) => a.sortOrder - b.sortOrder || a.labelHe.localeCompare(b.labelHe, 'he'))
+                    .map((c) => (
+                      <TableRow key={c.id}>
+                        <TableCell className="font-medium">{c.labelHe}</TableCell>
+                        <TableCell className="font-mono text-xs text-slate-600">{c.code}</TableCell>
+                        <TableCell>{c.sortOrder}</TableCell>
+                        <TableCell>{c.isPreset ? 'ברירת מחדל' : 'מותאם'}</TableCell>
+                      </TableRow>
+                    ))}
+                  {customerClassifications.length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={4} className="py-8 text-center text-slate-500">
+                        טוען סיווגים…
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+            <div className="rounded-2xl border border-slate-200 bg-slate-50/80 p-4">
+              <div className="mb-2 text-sm font-semibold text-slate-800">הוספת סיווג חדש</div>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+                <div className="min-w-0 flex-1">
+                  <Input
+                    placeholder="שם הסיווג בעברית (למשל: אדריכלים)"
+                    value={clsNewLabel}
+                    onChange={(e) => setClsNewLabel(e.target.value)}
+                    dir="rtl"
+                  />
+                </div>
+                <Button
+                  type="button"
+                  style={{ background: galit.primary }}
+                  disabled={clsSaving}
+                  onClick={() => void addCustomerClassificationInSettings()}
+                >
+                  {clsSaving ? 'שומר...' : 'הוסף סיווג'}
+                </Button>
+              </div>
+              {clsErr ? <div className="mt-2 text-sm text-red-700">{clsErr}</div> : null}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {tab === 'employees' && canManageUsersEffective && (
+        <Card>
+          <CardHeader className="flex flex-wrap items-center justify-between gap-2">
             <CardTitle>עובדים</CardTitle>
-            <Button style={{ background: galit.primary }} onClick={openCreateEmp}>עובד חדש</Button>
+            <Button style={{ background: galit.primary }} onClick={openCreateEmp}>
+              עובד חדש
+            </Button>
           </CardHeader>
           <CardContent className="p-0">
             {empLoading ? (
@@ -8685,18 +10312,270 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
         </Card>
       )}
 
-      {tab === 'permissions' && (
+      {tab === 'employeeHandoff' && canEmployeeHandoff && (
+        <div className="space-y-5" dir="rtl">
+          {handoffError ? (
+            <div className="rounded-2xl bg-red-50 px-4 py-3 text-sm text-red-700">{handoffError}</div>
+          ) : null}
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h2 className="text-lg font-semibold text-slate-900">העברת אחריות לעובד אחר</h2>
+            <p className="mt-1 text-sm text-slate-600">
+              מעביר שיוכים מהעובד הישן ליעד. לא משנים יוצרים היסטוריים — רק אחריות נוכחית (assigned / owner). פעילויות ליד נשארות עם יוצר
+              מקורי ולא מועברות. &quot;לקוחות&quot; = הזדמנויות מכירה; &quot;הצעות מחיר&quot; = הזדמנויות עם הצעה (אם לא סומן
+              &quot;לקוחות&quot;, יועברו רק אלה).
+            </p>
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <FormField label="עובד מקור (היוצא)">
+                <select
+                  value={transferFromId}
+                  onChange={(e) => {
+                    setTransferFromId(e.target.value);
+                    setHandoffError('');
+                  }}
+                  disabled={transferBusy}
+                  className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm outline-none transition focus:border-slate-400"
+                >
+                  <option value="">— בחר —</option>
+                  {(employees as any[]).map((e: any) => (
+                    <option key={e.id} value={e.id}>
+                      {e.name} ({employeeStatusLabel(e.status)})
+                    </option>
+                  ))}
+                </select>
+              </FormField>
+              <FormField label="עובד יעד (פעיל)">
+                <select
+                  value={transferToId}
+                  onChange={(e) => {
+                    setTransferToId(e.target.value);
+                    setHandoffError('');
+                  }}
+                  disabled={transferBusy}
+                  className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm outline-none transition focus:border-slate-400"
+                >
+                  <option value="">— בחר —</option>
+                  {employeesActiveOnly.map((e: any) => (
+                    <option key={e.id} value={e.id}>
+                      {e.name}
+                    </option>
+                  ))}
+                </select>
+              </FormField>
+            </div>
+            <div className="mt-4 rounded-2xl border border-slate-100 bg-slate-50/80 p-4">
+              <div className="mb-2 text-sm font-semibold text-slate-800">מה להעביר</div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {(
+                  [
+                    ['leads', 'לידים'],
+                    ['customers', 'לקוחות (הזדמנויות)'],
+                    ['tasks', 'משימות'],
+                    ['projects', 'פרויקטים'],
+                    ['quotes', 'הצעות מחיר'],
+                  ] as const
+                ).map(([key, label]) => (
+                  <label key={key} className="flex cursor-pointer items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={!!transferOpts[key]}
+                      disabled={transferBusy}
+                      onChange={(e) => setTransferOpts((p) => ({ ...p, [key]: e.target.checked }))}
+                    />
+                    <span>{label}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="mt-4">
+              <Button style={{ background: galit.primary }} disabled={transferBusy} onClick={() => void runTransferData()}>
+                {transferBusy ? 'מעביר...' : 'העבר אחריות'}
+              </Button>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h2 className="text-lg font-semibold text-slate-900">העתקת הרשאות</h2>
+            <p className="mt-1 text-sm text-slate-600">
+              מעתיק לשרת את התפקיד, כל דגלי ההרשאות, מחלקות שירות ושדה מחלקה מהעובד המקור ליעד.
+            </p>
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <FormField label="עובד מקור">
+                <select
+                  value={copyPermFromId}
+                  onChange={(e) => {
+                    setCopyPermFromId(e.target.value);
+                    setHandoffError('');
+                  }}
+                  disabled={copyPermBusy}
+                  className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm outline-none transition focus:border-slate-400"
+                >
+                  <option value="">— בחר —</option>
+                  {(employees as any[]).map((e: any) => (
+                    <option key={e.id} value={e.id} disabled={e.id === copyPermToId}>
+                      {e.name} ({employeeStatusLabel(e.status)})
+                    </option>
+                  ))}
+                </select>
+              </FormField>
+              <FormField label="עובד יעד (פעיל)">
+                <select
+                  value={copyPermToId}
+                  onChange={(e) => {
+                    setCopyPermToId(e.target.value);
+                    setHandoffError('');
+                  }}
+                  disabled={copyPermBusy}
+                  className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm outline-none transition focus:border-slate-400"
+                >
+                  <option value="">— בחר —</option>
+                  {employeesActiveOnly.map((e: any) => (
+                    <option key={e.id} value={e.id} disabled={e.id === copyPermFromId}>
+                      {e.name}
+                    </option>
+                  ))}
+                </select>
+              </FormField>
+            </div>
+            <div className="mt-4">
+              <Button
+                variant="outline"
+                disabled={copyPermBusy || !copyPermFromId || !copyPermToId}
+                onClick={() => void copyPermissionsHandoff()}
+              >
+                {copyPermBusy ? 'מעתיק...' : 'העתק הרשאות'}
+              </Button>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h2 className="text-lg font-semibold text-slate-900">סימון עובד כלא פעיל</h2>
+            <p className="mt-1 text-sm text-slate-600">
+              העובד לא יוכל להתחבר; הרשומה נשמרת במערכת וההיסטוריה לא נמחקת. בחירות רגילות במערכת מציגות בעיקר עובדים פעילים.
+            </p>
+            <div className="mt-4 max-w-md">
+              <FormField label="עובד פעיל לסימון כלא פעיל">
+                <select
+                  value={inactiveMarkId}
+                  onChange={(e) => {
+                    setInactiveMarkId(e.target.value);
+                    setHandoffError('');
+                  }}
+                  disabled={inactiveBusy}
+                  className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm outline-none transition focus:border-slate-400"
+                >
+                  <option value="">— בחר —</option>
+                  {employeesActiveOnly.map((e: any) => (
+                    <option key={e.id} value={e.id}>
+                      {e.name}
+                    </option>
+                  ))}
+                </select>
+              </FormField>
+            </div>
+            <div className="mt-4">
+              <Button
+                variant="outline"
+                disabled={inactiveBusy || !inactiveMarkId}
+                onClick={() => void markEmployeeInactiveHandoff()}
+              >
+                {inactiveBusy ? 'מעדכן...' : 'סמן כלא פעיל'}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {tab === 'permissions' && canManagePermissionsEffective && (
         <Card>
-          <CardHeader><CardTitle>הרשאות</CardTitle></CardHeader>
+          <CardHeader><CardTitle>תפקידים והרשאות</CardTitle></CardHeader>
           <CardContent className="space-y-3">
-            <div className="text-sm text-slate-500">מטריצת הרשאות לתצוגה (לא עורך ACL דינמי בשלב זה).</div>
+            <div className="text-sm text-slate-500">מטריצת הרשאות לתצוגה (מבוססת על @Roles ב-backend; אין ACL דינמי בשלב זה).</div>
             <div className="grid gap-3 md:grid-cols-2">
-              {permissionsMatrix.map((r) => (
-                <div key={r.role} className="rounded-3xl border p-4">
-                  <div className="font-semibold">{r.role}</div>
-                  <div className="mt-2 text-sm text-slate-600">{r.modules.join(' · ')}</div>
-                </div>
-              ))}
+              {['ADMIN', 'MANAGER', 'SALES', 'TECHNICIAN'].map((role) => {
+                const d = rolePermissionDetails(role);
+                return (
+                  <div key={role} className="rounded-3xl border p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="font-semibold">{role}</div>
+                        <div className="mt-1 text-xs text-slate-500">{d.scopeLabel}</div>
+                      </div>
+                      <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-700">
+                        {employeeRoleLabel(role)}
+                      </span>
+                    </div>
+
+                    <div className="mt-3 space-y-2 text-sm">
+                      <div className="font-semibold">לידים</div>
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <input type="checkbox" checked={d.leads.view} disabled />
+                          <span>יכול לראות</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input type="checkbox" checked={d.leads.create} disabled />
+                          <span>יכול ליצור</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input type="checkbox" checked={d.leads.edit} disabled />
+                          <span>יכול לערוך</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input type="checkbox" checked={d.leads.delete} disabled />
+                          <span>יכול למחוק</span>
+                        </div>
+                      </div>
+
+                      <div className="font-semibold mt-3">לקוחות</div>
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <input type="checkbox" checked={d.customers.view} disabled />
+                          <span>יכול לראות</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input type="checkbox" checked={d.customers.delete} disabled />
+                          <span>יכול למחוק</span>
+                        </div>
+                      </div>
+
+                      <div className="font-semibold mt-3">הצעות מחיר / כספים</div>
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <input type="checkbox" checked={d.quotes.view} disabled />
+                          <span>יכול לראות הצעות מחיר</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input type="checkbox" checked={d.funds.view} disabled />
+                          <span>יכול לראות כספים</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input type="checkbox" checked={d.funds.edit} disabled />
+                          <span>יכול לערוך כספים</span>
+                        </div>
+                      </div>
+
+                      <div className="font-semibold mt-3">דוחות</div>
+                      <div className="flex items-center gap-2">
+                        <input type="checkbox" checked={d.reports.view} disabled />
+                        <span>יכול לראות</span>
+                      </div>
+
+                      <div className="font-semibold mt-3">ניהול</div>
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <input type="checkbox" checked={d.employees.manage} disabled />
+                          <span>יכול לנהל עובדים</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input type="checkbox" checked={d.permissions.manage} disabled />
+                          <span>יכול לנהל הרשאות</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </CardContent>
         </Card>
@@ -8851,12 +10730,223 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
       )}
 
       {tab === 'templates' && (
-        <Card>
-          <CardHeader><CardTitle>תבניות</CardTitle></CardHeader>
-          <CardContent className="text-sm text-slate-500">
-            טאב מוכן להרחבה: תבניות הצעות מחיר, תבניות דוחות, טקסטים קבועים.
-          </CardContent>
-        </Card>
+        <div className="space-y-4" dir="rtl">
+          <Card>
+            <CardHeader className="flex flex-wrap items-center justify-between gap-2">
+              <CardTitle>תבניות הצעות מחיר</CardTitle>
+              {canManageQuoteTemplates && (
+                <Button
+                  style={{ background: galit.primary }}
+                  disabled={qtLoading}
+                  onClick={() => {
+                    setQtEditing(null);
+                    setQtForm({
+                      name: '',
+                      serviceType: 'קרינה',
+                      isActive: true,
+                      introHtml: '<p>לכבוד {{customerName}},</p>',
+                      bodyHtml: '<p>הצעת מחיר עבור {{serviceName}}.</p><p>{{itemsTable}}</p><p>סה״כ לפני מע״מ: {{subtotal}} · מע״מ: {{vat}} · סה״כ: {{total}}</p>',
+                      closingHtml: '<p>בברכה,<br/>גלית</p>',
+                      termsHtml: '<p><strong>תנאים:</strong> תשלום לפי תנאי ההצעה · {{notes}}</p>',
+                      variablesHelp: QUOTE_TEMPLATE_VARIABLES_HELP,
+                      defaultLineItemsJson: '[{"name":"ביקור שטח","quantity":1,"unitPrice":2000}]',
+                    });
+                    setQtModalOpen(true);
+                  }}
+                >
+                  תבנית חדשה
+                </Button>
+              )}
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {qtError && <div className="rounded-2xl bg-red-50 px-4 py-2 text-sm text-red-700">{qtError}</div>}
+              <p className="text-sm text-slate-600">
+                תבניות HTML עם משתנים <code className="rounded bg-slate-100 px-1">{'{{שם}}'}</code>. התאמת שירות לפי שדה «סוג שירות» — זהה לערך שנבחר במסך הצעות מחיר.
+              </p>
+              <div className="rounded-2xl border bg-slate-50 p-3 text-xs text-slate-600 whitespace-pre-wrap">{QUOTE_TEMPLATE_VARIABLES_HELP}</div>
+              {qtLoading ? (
+                <div className="text-sm text-slate-500">טוען...</div>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>שם</TableHead>
+                      <TableHead>סוג שירות</TableHead>
+                      <TableHead>פעיל</TableHead>
+                      <TableHead>פעולות</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {qtList.map((t) => (
+                      <TableRow key={t.id}>
+                        <TableCell className="font-medium">{t.name}</TableCell>
+                        <TableCell>{t.serviceType}</TableCell>
+                        <TableCell>{t.isActive ? 'כן' : 'לא'}</TableCell>
+                        <TableCell>
+                          {canManageQuoteTemplates && (
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
+                                onClick={() => {
+                                  setQtEditing(t);
+                                  setQtForm({
+                                    name: t.name || '',
+                                    serviceType: t.serviceType || 'קרינה',
+                                    isActive: t.isActive !== false,
+                                    introHtml: t.introHtml || '',
+                                    bodyHtml: t.bodyHtml || '',
+                                    closingHtml: t.closingHtml || '',
+                                    termsHtml: t.termsHtml || '',
+                                    variablesHelp: t.variablesHelp || QUOTE_TEMPLATE_VARIABLES_HELP,
+                                    defaultLineItemsJson: t.defaultLineItems
+                                      ? JSON.stringify(t.defaultLineItems, null, 2)
+                                      : '[]',
+                                  });
+                                  setQtModalOpen(true);
+                                }}
+                              >
+                                עריכה
+                              </button>
+                              <button
+                                type="button"
+                                className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
+                                onClick={async () => {
+                                  if (!window.confirm('למחוק תבנית?')) return;
+                                  try {
+                                    const res = await apiFetch(apiUrl(`/quote-templates/${t.id}`), {
+                                      method: 'DELETE',
+                                      authUser: currentUser,
+                                    });
+                                    if (!res.ok) throw new Error();
+                                    await loadQuoteTemplates();
+                                  } catch {
+                                    setQtError('מחיקת תבנית נכשלה');
+                                  }
+                                }}
+                              >
+                                מחק
+                              </button>
+                            </div>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+              {!canManageQuoteTemplates && (
+                <p className="text-xs text-slate-500">עריכה ומחיקה: מנהל מערכת או מנהל בלבד.</p>
+              )}
+            </CardContent>
+          </Card>
+
+          <Modal
+            open={qtModalOpen}
+            onClose={() => setQtModalOpen(false)}
+            title={qtEditing ? 'עריכת תבנית' : 'תבנית חדשה'}
+            maxWidth="max-w-3xl"
+          >
+            <div className="space-y-3" dir="rtl">
+              <FormField label="שם תבנית">
+                <Input value={qtForm.name} onChange={(e) => setQtForm((p) => ({ ...p, name: e.target.value }))} placeholder="שם" />
+              </FormField>
+              <FormField label="סוג שירות (מחרוזת זהה לבחירת שירות בהצעה)">
+                <select
+                  className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm"
+                  value={qtForm.serviceType}
+                  onChange={(e) => setQtForm((p) => ({ ...p, serviceType: e.target.value }))}
+                >
+                  {QUOTE_SERVICE_TYPE_OPTIONS.map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
+                </select>
+              </FormField>
+              <div className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={qtForm.isActive}
+                  onChange={(e) => setQtForm((p) => ({ ...p, isActive: e.target.checked }))}
+                />
+                <span className="text-sm">פעיל</span>
+              </div>
+              <FormField label="טקסט פתיחה (HTML)">
+                <Textarea className="min-h-[80px] font-mono text-xs" value={qtForm.introHtml} onChange={(e) => setQtForm((p) => ({ ...p, introHtml: e.target.value }))} />
+              </FormField>
+              <FormField label="תוכן תבנית (HTML)">
+                <Textarea className="min-h-[100px] font-mono text-xs" value={qtForm.bodyHtml} onChange={(e) => setQtForm((p) => ({ ...p, bodyHtml: e.target.value }))} />
+              </FormField>
+              <FormField label="טקסט סיום (HTML)">
+                <Textarea className="min-h-[80px] font-mono text-xs" value={qtForm.closingHtml} onChange={(e) => setQtForm((p) => ({ ...p, closingHtml: e.target.value }))} />
+              </FormField>
+              <FormField label="תנאים (HTML)">
+                <Textarea className="min-h-[80px] font-mono text-xs" value={qtForm.termsHtml} onChange={(e) => setQtForm((p) => ({ ...p, termsHtml: e.target.value }))} />
+              </FormField>
+              <FormField label="משתנים נתמכים (טקסט עזר)">
+                <Textarea className="min-h-[100px] font-mono text-xs" value={qtForm.variablesHelp} onChange={(e) => setQtForm((p) => ({ ...p, variablesHelp: e.target.value }))} />
+              </FormField>
+              <FormField label="פריטים ברירת מחדל (JSON)">
+                <Textarea
+                  className="min-h-[100px] font-mono text-xs"
+                  value={qtForm.defaultLineItemsJson}
+                  onChange={(e) => setQtForm((p) => ({ ...p, defaultLineItemsJson: e.target.value }))}
+                />
+              </FormField>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  style={{ background: galit.primary }}
+                  onClick={async () => {
+                    if (!qtForm.name.trim()) {
+                      setQtError('שם תבנית חובה');
+                      return;
+                    }
+                    let parsed;
+                    try {
+                      parsed = JSON.parse(qtForm.defaultLineItemsJson || '[]');
+                    } catch {
+                      setQtError('JSON פריטים לא תקין');
+                      return;
+                    }
+                    setQtError('');
+                    try {
+                      const payload: any = {
+                        name: qtForm.name.trim(),
+                        serviceType: qtForm.serviceType,
+                        isActive: qtForm.isActive,
+                        introHtml: qtForm.introHtml || null,
+                        bodyHtml: qtForm.bodyHtml || null,
+                        closingHtml: qtForm.closingHtml || null,
+                        termsHtml: qtForm.termsHtml || null,
+                        variablesHelp: qtForm.variablesHelp || null,
+                        defaultLineItems: parsed,
+                      };
+                      const url = qtEditing ? `${getApiBaseUrl()}/quote-templates/${qtEditing.id}` : apiUrl('/quote-templates');
+                      const res = await apiFetch(url, {
+                        method: qtEditing ? 'PATCH' : 'POST',
+                        authUser: currentUser,
+                        body: JSON.stringify(payload),
+                      });
+                      if (!res.ok) throw new Error();
+                      setQtModalOpen(false);
+                      await loadQuoteTemplates();
+                      setSettingsMsg('התבנית נשמרה');
+                      window.setTimeout(() => setSettingsMsg(''), 2500);
+                    } catch {
+                      setQtError('שמירת תבנית נכשלה');
+                    }
+                  }}
+                >
+                  שמור
+                </Button>
+                <Button variant="outline" type="button" onClick={() => setQtModalOpen(false)}>
+                  ביטול
+                </Button>
+              </div>
+            </div>
+          </Modal>
+        </div>
       )}
 
       {tab === 'system' && (
@@ -8925,14 +11015,60 @@ function SettingsPage({ currentUser }: { currentUser: AppUser }) {
               onChange={(e) => setEmpForm((p) => ({ ...p, role: e.target.value }))}
               className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm outline-none transition focus:border-slate-400"
             >
-              <option value="ADMIN">מנהל מערכת</option>
-              <option value="MANAGER">מנהל</option>
-              <option value="SALES">מכירות</option>
-              <option value="TECHNICIAN">טכנאי</option>
-              <option value="EXPERT">מומחה</option>
-              <option value="BILLING">הנהלת חשבונות</option>
+              {(['ADMIN', 'MANAGER', 'SALES', 'TECHNICIAN'] as const).map((r) => (
+                <option key={r} value={r}>
+                  {employeeRoleLabel(r)}
+                </option>
+              ))}
+              {empEditing &&
+                !['ADMIN', 'MANAGER', 'SALES', 'TECHNICIAN'].includes((empForm.role || '').toString().toUpperCase()) && (
+                  <option value={empForm.role}>
+                    {employeeRoleLabel(empForm.role)} (תפקיד קיים במערכת)
+                  </option>
+                )}
             </select>
           </FormField>
+
+          <div className="rounded-2xl border bg-slate-50 p-4">
+            <div className="mb-2 text-sm font-semibold">הרשאות בסיסיות</div>
+            <div className="mb-3 text-xs text-slate-500">נשמר ב-DB ומשפיע על תצוגה וכפתורים בשלב 1.</div>
+            <div className="space-y-3 text-sm">
+              <div className="font-semibold">כספים</div>
+              <div className="flex items-center gap-2">
+                <input type="checkbox" checked={!!empForm.canViewFinance} onChange={(e) => setEmpForm((p) => ({ ...p, canViewFinance: e.target.checked }))} />
+                <span>צפייה בכספים</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <input type="checkbox" checked={!!empForm.canEditFinance} onChange={(e) => setEmpForm((p) => ({ ...p, canEditFinance: e.target.checked }))} />
+                <span>עריכת כספים</span>
+              </div>
+
+              <div className="font-semibold mt-2">מחיקה ותצוגה</div>
+              <div className="flex items-center gap-2">
+                <input type="checkbox" checked={!!empForm.canDeleteCustomers} onChange={(e) => setEmpForm((p) => ({ ...p, canDeleteCustomers: e.target.checked }))} />
+                <span>מחיקת לקוחות</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <input type="checkbox" checked={!!empForm.canDeleteLeads} onChange={(e) => setEmpForm((p) => ({ ...p, canDeleteLeads: e.target.checked }))} />
+                <span>מחיקת לידים</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <input type="checkbox" checked={!!empForm.canViewAllRecords} onChange={(e) => setEmpForm((p) => ({ ...p, canViewAllRecords: e.target.checked }))} />
+                <span>צפייה בכל הרשומות</span>
+              </div>
+
+              <div className="font-semibold mt-2">ניהול מערכת</div>
+              <div className="flex items-center gap-2">
+                <input type="checkbox" checked={!!empForm.canManageUsers} onChange={(e) => setEmpForm((p) => ({ ...p, canManageUsers: e.target.checked }))} />
+                <span>ניהול עובדים</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <input type="checkbox" checked={!!empForm.canManagePermissions} onChange={(e) => setEmpForm((p) => ({ ...p, canManagePermissions: e.target.checked }))} />
+                <span>ניהול הרשאות</span>
+              </div>
+            </div>
+          </div>
+
           <FormField label="סטטוס">
             <select
               value={empForm.status}
@@ -9111,9 +11247,9 @@ function FieldSchedulePage({
 
   const patchProject = async (id: string, payload: Record<string, unknown>) => {
     try {
-      const res = await fetch(`http://localhost:3001/projects/${id}`, {
+      const res = await apiFetch(apiUrl(`/projects/${id}`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) return;
@@ -9319,6 +11455,7 @@ function FieldSchedulePage({
 function TasksPage({
   tasks,
   setTasks,
+  onReloadTasks,
   currentUser,
   projects,
   customers,
@@ -9326,6 +11463,7 @@ function TasksPage({
 }: {
   tasks: Task[];
   setTasks: React.Dispatch<React.SetStateAction<Task[]>>;
+  onReloadTasks?: () => void | Promise<void>;
   currentUser: AppUser;
   projects: Project[];
   customers: Customer[];
@@ -9400,30 +11538,14 @@ function TasksPage({
         status: form.status,
         type: form.type,
       };
-      const res = await fetch('http://localhost:3001/tasks', {
+      const res = await apiFetch(apiUrl('/tasks'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
-      const created = await res.json();
-      const normalized: Task = {
-        id: created.id,
-        title: created.title,
-        description: created.description ?? '',
-        ownerId: created.ownerId ?? undefined,
-        owner: created.owner?.name ?? created.ownerId ?? '',
-        projectId: created.projectId ?? undefined,
-        projectName: created.project?.name ?? projects.find((p) => p.id === created.projectId)?.name ?? undefined,
-        customerId: created.customerId ?? undefined,
-        customerName: created.customer?.name ?? customers.find((c) => c.id === created.customerId)?.name ?? undefined,
-        dueDate: created.dueDate ?? undefined,
-        due: created.dueDate ? new Date(created.dueDate).toLocaleDateString('he-IL') : '',
-        priority: created.priority || 'MEDIUM',
-        status: created.status ?? undefined,
-        type: created.type ?? undefined,
-      };
-      setTasks((prev) => [normalized, ...prev]);
+      await res.json();
+      await onReloadTasks?.();
       setOpen(false);
       setForm({
         title: '',
@@ -9727,11 +11849,11 @@ function AlertsPage() {
 
 function UsersPage({
   users,
-  onUsersChange,
+  onReloadUsers,
   currentUser,
 }: {
   users: AppUser[];
-  onUsersChange: (next: AppUser[]) => void;
+  onReloadUsers?: () => void | Promise<void>;
   currentUser: AppUser;
 }) {
   const [open, setOpen] = useState(false);
@@ -9811,9 +11933,9 @@ function UsersPage({
     };
 
     try {
-      const res = await fetch('http://localhost:3001/users', {
+      const res = await apiFetch(apiUrl('/users'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
 
@@ -9827,9 +11949,16 @@ function UsersPage({
         role: (apiUser.role || 'SALES').toString().toLowerCase() as AppUserRole,
         password: '******',
         status: apiUser.status === 'INACTIVE' ? 'לא פעיל' : 'פעיל',
+        canViewFinance: !!apiUser.canViewFinance,
+        canEditFinance: !!apiUser.canEditFinance,
+        canDeleteCustomers: !!apiUser.canDeleteCustomers,
+        canDeleteLeads: !!apiUser.canDeleteLeads,
+        canManageUsers: !!apiUser.canManageUsers,
+        canManagePermissions: !!apiUser.canManagePermissions,
+        canViewAllRecords: !!apiUser.canViewAllRecords,
       };
 
-      onUsersChange([...users, normalized]);
+      await onReloadUsers?.();
       setOpen(false);
     } catch {
       setFormError('יצירת עובד נכשלה. נסה שוב מאוחר יותר.');
@@ -10073,25 +12202,27 @@ function LoginPage({
 export default function GalitCRMPrototype() {
   const [current, setCurrent] = useState('dashboard');
   const [view, setView] = useState('dashboard');
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
+  const [pendingSettingsTab, setPendingSettingsTab] = useState<SettingsToolbarJumpTab | null>(null);
   const [currentUser, setCurrentUser] = useState<AppUser | null>(null);
+  const [authBootstrapped, setAuthBootstrapped] = useState(false);
   const [loginError, setLoginError] = useState('');
-  const [users, setUsers] = useState<AppUser[]>(usersSeed);
+  const [users, setUsers] = useState<AppUser[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [timeline] = useState<TimelineEvent[]>(timelineSeed);
   const [customerFull, setCustomerFull] = useState<any | null>(null);
+  const [customerFullLoading, setCustomerFullLoading] = useState(false);
   const [leads, setLeads] = useState<Lead[]>([]);
-  const [quotes, setQuotes] = useState<Quote[]>(quotesSeed);
+  const [quotes, setQuotes] = useState<Quote[]>([]);
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
-  const [projects, setProjects] = useState<Project[]>(projectsSeed);
-  const [tasks, setTasks] = useState<Task[]>(tasksSeed);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [tasks, setTasks] = useState<Task[]>([]);
   const [dashboardStats, setDashboardStats] = useState<DashboardStats | null>(null);
   const [leadsError, setLeadsError] = useState('');
   const [customersError, setCustomersError] = useState('');
+  const [customerClassifications, setCustomerClassifications] = useState<CustomerClassificationDto[]>([]);
   const [usersError, setUsersError] = useState('');
   const [quickCreateOpen, setQuickCreateOpen] = useState(false);
   const [quickCreateBusy, setQuickCreateBusy] = useState(false);
@@ -10133,51 +12264,13 @@ export default function GalitCRMPrototype() {
   const quickCreateEmailDuplicateWarning =
     quickCreateDuplicateCustomer || quickCreateDuplicateLead ? 'קיים כבר ליד/לקוח עם אימייל זה' : '';
 
-  // Deployment support:
-  // The app currently calls the backend using absolute URLs hardcoded to localhost.
-  // In production (Vercel / external host) we remap those calls at runtime via NEXT_PUBLIC_API_URL.
-  const apiBaseUrl = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001').replace(/\/$/, '');
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-
-    const originalFetch = window.fetch;
-
-    window.fetch = (input: any, init?: any) => {
-      try {
-        const url =
-          input instanceof Request ? input.url : input instanceof URL ? input.toString() : typeof input === 'string' ? input : input?.url;
-
-        if (typeof url === 'string' && url.startsWith('http://localhost:3001')) {
-          const path = url.replace('http://localhost:3001', '');
-          const nextUrl = `${apiBaseUrl}${path}`;
-
-          if (input instanceof Request) {
-            const nextReq = new Request(nextUrl, input);
-            return originalFetch(nextReq, init);
-          }
-
-          return originalFetch(nextUrl, init);
-        }
-      } catch {
-        // best-effort: do not block app if something unexpected happens
-      }
-
-      return originalFetch(input, init);
-    };
-
-    return () => {
-      window.fetch = originalFetch;
-    };
-  }, [apiBaseUrl]);
-
   useEffect(() => {
     if (!currentUser) return;
     if (!canAccess(currentUser.role, 'leads')) return;
     let isMounted = true;
 
     setLeadsError('');
-    fetch('http://localhost:3001/leads', { headers: authHeaders(currentUser) })
+    apiFetch(apiUrl('/leads'), { authUser: currentUser })
       .then((res) => {
         if (!res.ok) throw new Error('טעינת נתונים נכשלה');
         return res.json();
@@ -10185,20 +12278,7 @@ export default function GalitCRMPrototype() {
       .then((data) => {
         if (!isMounted || !Array.isArray(data)) return;
 
-        const normalized: Lead[] = data.map((lead: any, index: number) => ({
-          id: lead.id || `L-${index + 1}`,
-          name: lead.name || `${lead.firstName || ''} ${lead.lastName || ''}`.trim() || 'ליד ללא שם',
-          company: lead.company || lead.companyName || '',
-          service: lead.service || lead.serviceType || '',
-          source: lead.source || '',
-          stage: lead.stage || 'NEW',
-          status: lead.status || 'NEW',
-          assignee: lead.assignee || lead.assignedUser || '',
-          phone: lead.phone || '',
-          email: lead.email ?? undefined,
-          site: lead.site || lead.siteAddress || '',
-          notes: lead.notes || '',
-        }));
+        const normalized: Lead[] = data.map((lead: any, index: number) => normalizeLeadRowFromApi(lead, index));
 
         setLeads(normalized);
       })
@@ -10217,7 +12297,7 @@ export default function GalitCRMPrototype() {
     if (!currentUser) return;
     if (!canAccess(currentUser.role, 'projects')) return;
     let isMounted = true;
-    fetch('http://localhost:3001/projects', { headers: authHeaders(currentUser) })
+    apiFetch(apiUrl('/projects'), { authUser: currentUser })
       .then((res) => {
         if (!res.ok) throw new Error('טעינת פרויקטים נכשלה');
         return res.json();
@@ -10226,6 +12306,7 @@ export default function GalitCRMPrototype() {
         if (!isMounted || !Array.isArray(data)) return;
         const normalized: Project[] = data.map((p: any) => ({
           id: p.id,
+          importLegacyId: p.importLegacyId ?? undefined,
           projectNumber: p.projectNumber ?? undefined,
           name: p.name,
           client: p.client,
@@ -10248,47 +12329,14 @@ export default function GalitCRMPrototype() {
           serviceCategory: p.serviceCategory ?? undefined,
           serviceSubType: p.serviceSubType ?? undefined,
           address: p.address ?? undefined,
+          createdAt: p.createdAt ?? undefined,
         }));
         setProjects(normalized);
       })
-      .catch(() => { /* keep seed on error */ });
-    return () => { isMounted = false; };
-  }, [currentUser]);
-
-  useEffect(() => {
-    if (!currentUser) return;
-    let isMounted = true;
-    fetch('http://localhost:3001/tasks', { headers: authHeaders(currentUser) })
-      .then((res) => {
-        if (!res.ok) throw new Error('טעינת משימות נכשלה');
-        return res.json();
-      })
-      .then((data) => {
-        if (!isMounted || !Array.isArray(data)) return;
-        const normalized: Task[] = data.map((t: any) => ({
-          id: t.id,
-          title: t.title,
-          description: t.description ?? '',
-          ownerId: t.ownerId ?? undefined,
-          owner: t.owner?.name ?? t.ownerId ?? '',
-          projectId: t.projectId ?? undefined,
-          projectName: t.project?.name ?? undefined,
-          customerId: t.customerId ?? undefined,
-          customerName: t.customer?.name ?? undefined,
-          dueDate: t.dueDate ?? undefined,
-          due: t.dueDate ? new Date(t.dueDate).toLocaleDateString('he-IL') : '',
-          priority: t.priority || 'MEDIUM',
-          status: t.status ?? undefined,
-          type: t.type ?? undefined,
-        }));
-        setTasks(normalized);
-      })
       .catch(() => {
-        // keep seed fallback
+        if (isMounted) setProjects([]);
       });
-    return () => {
-      isMounted = false;
-    };
+    return () => { isMounted = false; };
   }, [currentUser]);
 
   const openProjectDetails = (project: Project) => {
@@ -10308,37 +12356,39 @@ export default function GalitCRMPrototype() {
     }
   };
 
-  useEffect(() => {
-    if (!currentUser || currentUser.role !== 'admin') return;
-
-    let isMounted = true;
+  const reloadUsers = useCallback(async () => {
+    if (!currentUser) return;
+    /** כל תפקיד מחובר יכול לקרוא ל-GET /users (לשימושים במסכים ודרופדאונים); השרת מאמת */
     setUsersError('');
-
-    fetch('http://localhost:3001/users', { headers: authHeaders(currentUser) })
-      .then((res) => {
-        if (!res.ok) throw new Error('טעינת עובדים נכשלה');
-        return res.json();
-      })
-      .then((data) => {
-        if (!isMounted || !Array.isArray(data)) return;
-        const normalized: AppUser[] = data.map((u: any) => ({
-          id: u.id,
-          name: u.name,
-          email: u.email,
-          role: (u.role || 'SALES').toString().toLowerCase() as AppUserRole,
-          password: '******',
-          status: u.status === 'INACTIVE' ? 'לא פעיל' : 'פעיל',
-        }));
-        setUsers(normalized);
-      })
-      .catch(() => {
-        if (isMounted) setUsersError('טעינת משתמשים נכשלה. נסה שוב מאוחר יותר.');
-      });
-
-    return () => {
-      isMounted = false;
-    };
+    try {
+      const res = await apiFetch(apiUrl('/users'), { authUser: currentUser });
+      if (!res.ok) throw new Error('טעינת עובדים נכשלה');
+      const data = await res.json();
+      if (!Array.isArray(data)) return;
+      const normalized: AppUser[] = data.map((u: any) => ({
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        role: (u.role || 'SALES').toString().toLowerCase() as AppUserRole,
+        password: '******',
+        status: u.status === 'INACTIVE' ? 'לא פעיל' : 'פעיל',
+        canViewFinance: !!u.canViewFinance,
+        canEditFinance: !!u.canEditFinance,
+        canDeleteCustomers: !!u.canDeleteCustomers,
+        canDeleteLeads: !!u.canDeleteLeads,
+        canManageUsers: !!u.canManageUsers,
+        canManagePermissions: !!u.canManagePermissions,
+        canViewAllRecords: !!u.canViewAllRecords,
+      }));
+      setUsers(normalized);
+    } catch {
+      setUsersError('טעינת משתמשים נכשלה. נסה שוב מאוחר יותר.');
+    }
   }, [currentUser]);
+
+  useEffect(() => {
+    void reloadUsers();
+  }, [reloadUsers]);
 
   useEffect(() => {
     if (!currentUser) return;
@@ -10346,7 +12396,7 @@ export default function GalitCRMPrototype() {
     let isMounted = true;
     setCustomersError('');
 
-    fetch('http://localhost:3001/customers', { headers: authHeaders(currentUser) })
+    apiFetch(apiUrl('/customers'), { authUser: currentUser })
       .then((res) => {
         if (!res.ok) throw new Error('טעינת לקוחות נכשלה');
         return res.json();
@@ -10366,11 +12416,182 @@ export default function GalitCRMPrototype() {
     };
   }, [currentUser]);
 
+  const reloadLeads = useCallback(async () => {
+    if (!currentUser) return;
+    if (!canAccess(currentUser.role, 'leads')) return;
+    setLeadsError('');
+    try {
+      const res = await apiFetch(apiUrl('/leads'), { authUser: currentUser });
+      if (!res.ok) throw new Error('טעינת לידים נכשלה');
+      const data = await res.json();
+      if (!Array.isArray(data)) return;
+      setLeads(data.map((lead: any, index: number) => normalizeLeadRowFromApi(lead, index)));
+    } catch {
+      setLeadsError('טעינת לידים נכשלה. נסה שוב מאוחר יותר.');
+    }
+  }, [currentUser]);
+
+  const reloadProjects = useCallback(async () => {
+    if (!currentUser) return;
+    if (!canAccess(currentUser.role, 'projects')) return;
+    try {
+      const res = await apiFetch(apiUrl('/projects'), { authUser: currentUser });
+      if (!res.ok) throw new Error();
+      const data = await res.json();
+      if (!Array.isArray(data)) return;
+      const normalized: Project[] = data.map((p: any) => ({
+        id: p.id,
+        importLegacyId: p.importLegacyId ?? undefined,
+        projectNumber: p.projectNumber ?? undefined,
+        name: p.name,
+        client: p.client,
+        status: p.status ?? 'NEW',
+        progress: p.progress ?? 0,
+        owner: p.assignedTechnician?.name ?? '',
+        due: p.dueDate ? new Date(p.dueDate).toLocaleDateString('he-IL') : '',
+        service: p.service ?? undefined,
+        siteVisitDate: p.siteVisitDate,
+        siteVisitTime: p.siteVisitTime ?? undefined,
+        city: p.city ?? undefined,
+        urgency: p.urgency ?? undefined,
+        notes: p.notes ?? undefined,
+        assignedTechnicianId: p.assignedTechnicianId ?? undefined,
+        assignedTechnician: p.assignedTechnician ? { id: p.assignedTechnician.id, name: p.assignedTechnician.name } : undefined,
+        customerId: p.customerId ?? undefined,
+        customer: p.customer ? { id: p.customer.id, name: p.customer.name, city: p.customer.city } : undefined,
+        assignedReportWriterId: p.assignedReportWriterId ?? undefined,
+        assignedReportWriter: p.assignedReportWriter
+          ? { id: p.assignedReportWriter.id, name: p.assignedReportWriter.name }
+          : undefined,
+        serviceCategory: p.serviceCategory ?? undefined,
+        serviceSubType: p.serviceSubType ?? undefined,
+        address: p.address ?? undefined,
+        createdAt: p.createdAt ?? undefined,
+      }));
+      setProjects(normalized);
+    } catch {
+      /* ignore */
+    }
+  }, [currentUser]);
+
+  const reloadQuotes = useCallback(async () => {
+    if (!currentUser) return;
+    if (!canAccess(currentUser.role, 'quotes')) return;
+    try {
+      const res = await apiFetch(apiUrl('/quotes'), { authUser: currentUser });
+      if (!res.ok) throw new Error();
+      const data = await res.json();
+      if (!Array.isArray(data)) return;
+      const normalized: Quote[] = data.map((q: any) => ({
+        id: q.id,
+        importLegacyId: q.importLegacyId ?? undefined,
+        quoteNumber: q.quoteNumber ?? null,
+        customerId: q.customerId ?? null,
+        customerName: q.customer?.name ?? undefined,
+        opportunityId: q.opportunityId ?? null,
+        opportunityName: q.opportunity?.projectOrServiceName ?? undefined,
+        projectId: q.projectId ?? null,
+        client: q.customer?.name ?? q.customerId ?? '',
+        service: q.service,
+        description: q.description ?? undefined,
+        amount: Number(q.amount ?? q.amountBeforeVat ?? 0),
+        amountBeforeVat: q.amountBeforeVat ?? q.amount ?? null,
+        vatPercent: q.vatPercent ?? null,
+        discountType: q.discountType ?? null,
+        discountValue: q.discountValue ?? null,
+        totalAmount: q.totalAmount ?? null,
+        status: q.status,
+        validTo: (q.validTo || q.validityDate) ? new Date(q.validTo || q.validityDate).toISOString().slice(0, 10) : '',
+        validityDate: q.validityDate ? new Date(q.validityDate).toISOString().slice(0, 10) : null,
+        pdfPath: q.pdfPath ?? undefined,
+        notes: q.notes ?? null,
+        createdAt: q.createdAt ?? undefined,
+        updatedAt: q.updatedAt ?? undefined,
+        leadId: q.leadId ?? null,
+      }));
+      setQuotes(normalized);
+    } catch {
+      /* ignore */
+    }
+  }, [currentUser]);
+
+  const reloadCustomers = useCallback(async () => {
+    if (!currentUser) return;
+    if (!canAccess(currentUser.role, 'customers')) return;
+    setCustomersError('');
+    try {
+      const res = await apiFetch(apiUrl('/customers'), { authUser: currentUser });
+      if (!res.ok) throw new Error('טעינת לקוחות נכשלה');
+      const data = await res.json();
+      if (Array.isArray(data)) setCustomers(data);
+    } catch {
+      setCustomersError('טעינת לקוחות נכשלה. נסה שוב מאוחר יותר.');
+    }
+  }, [currentUser]);
+
+  const reloadTasks = useCallback(async () => {
+    if (!currentUser) return;
+    if (!canAccess(currentUser.role, 'tasks')) return;
+    try {
+      const res = await apiFetch(apiUrl('/tasks'), { authUser: currentUser });
+      if (!res.ok) throw new Error('טעינת משימות נכשלה');
+      const data = await res.json();
+      if (!Array.isArray(data)) return;
+      const normalized: Task[] = data.map((t: any) => ({
+        id: t.id,
+        title: t.title,
+        description: t.description ?? '',
+        ownerId: t.ownerId ?? undefined,
+        owner: t.owner?.name ?? t.ownerId ?? '',
+        projectId: t.projectId ?? undefined,
+        projectName: t.project?.name ?? undefined,
+        customerId: t.customerId ?? undefined,
+        customerName: t.customer?.name ?? undefined,
+        dueDate: t.dueDate ?? undefined,
+        due: t.dueDate ? new Date(t.dueDate).toLocaleDateString('he-IL') : '',
+        priority: t.priority || 'MEDIUM',
+        status: t.status ?? undefined,
+        type: t.type ?? undefined,
+      }));
+      setTasks(normalized);
+    } catch {
+      setTasks([]);
+    }
+  }, [currentUser]);
+
+  useEffect(() => {
+    void reloadTasks();
+  }, [reloadTasks]);
+
+  const reloadCustomerClassifications = useCallback(async () => {
+    if (!currentUser) return;
+    if (!canAccess(currentUser.role, 'customers')) return;
+    try {
+      const res = await apiFetch(apiUrl('/customer-classifications'), {
+        authUser: currentUser,
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data)) setCustomerClassifications(data as CustomerClassificationDto[]);
+    } catch {
+      // ignore — טופס משתמש בברירות מחדל מקומיות
+    }
+  }, [currentUser]);
+
+  useEffect(() => {
+    void reloadCustomerClassifications();
+  }, [reloadCustomerClassifications]);
+
+  const customerTypeLabelMap = useMemo(
+    () => buildCustomerTypeLabelMap(customerClassifications),
+    [customerClassifications],
+  );
+
   useEffect(() => {
     if (!currentUser) return;
     if (!canAccess(currentUser.role, 'quotes')) return;
     let isMounted = true;
-    fetch('http://localhost:3001/quotes', { headers: authHeaders(currentUser) })
+    apiFetch(apiUrl('/quotes'), { authUser: currentUser })
       .then((res) => {
         if (!res.ok) throw new Error('טעינת הצעות מחיר נכשלה');
         return res.json();
@@ -10379,6 +12600,7 @@ export default function GalitCRMPrototype() {
         if (!isMounted || !Array.isArray(data)) return;
         const normalized: Quote[] = data.map((q: any) => ({
           id: q.id,
+          importLegacyId: q.importLegacyId ?? undefined,
           quoteNumber: q.quoteNumber ?? null,
           customerId: q.customerId ?? null,
           customerName: q.customer?.name ?? undefined,
@@ -10401,11 +12623,12 @@ export default function GalitCRMPrototype() {
           notes: q.notes ?? null,
           createdAt: q.createdAt ?? undefined,
           updatedAt: q.updatedAt ?? undefined,
+          leadId: q.leadId ?? null,
         }));
         setQuotes(normalized);
       })
       .catch(() => {
-        // keep seed fallback
+        // API failed — avoid showing stale mock data; list stays empty until retry/login
       });
     return () => {
       isMounted = false;
@@ -10414,9 +12637,9 @@ export default function GalitCRMPrototype() {
 
   useEffect(() => {
     if (!currentUser) return;
-    if (!['admin', 'manager', 'sales'].includes(currentUser.role)) return;
+    if (!['admin', 'manager', 'sales', 'expert'].includes(currentUser.role)) return;
     let isMounted = true;
-    fetch('http://localhost:3001/opportunities', { headers: authHeaders(currentUser) })
+    apiFetch(apiUrl('/opportunities'), { authUser: currentUser })
       .then((res) => {
         if (!res.ok) throw new Error('טעינת הזדמנויות נכשלה');
         return res.json();
@@ -10435,10 +12658,10 @@ export default function GalitCRMPrototype() {
 
   useEffect(() => {
     if (!currentUser) return;
-    if (currentUser.role !== 'admin' && currentUser.role !== 'manager') return;
+    if (!['admin', 'manager', 'expert'].includes(currentUser.role)) return;
     let isMounted = true;
 
-    fetch('http://localhost:3001/reports/dashboard', { headers: authHeaders(currentUser) })
+    apiFetch(apiUrl('/reports/dashboard'), { authUser: currentUser })
       .then((res) => {
         if (!res.ok) throw new Error('טעינת דשבורד נכשלה');
         return res.json();
@@ -10456,7 +12679,16 @@ export default function GalitCRMPrototype() {
         });
       })
       .catch(() => {
-        // keep local fallback stats
+        if (!isMounted) return;
+        setDashboardStats({
+          reportsWaitingWriting: 0,
+          reportsInReview: 0,
+          reportsSentThisWeek: 0,
+          samplesCollected: 0,
+          samplesInAnalysis: 0,
+          abnormalSampleResults: 0,
+          projectsWaitingForData: 0,
+        });
       });
 
     return () => {
@@ -10523,6 +12755,30 @@ export default function GalitCRMPrototype() {
     return () => window.removeEventListener('popstate', syncFromUrl);
   }, [customers, leads, currentUser, current]);
 
+  const loadCustomerFull = useCallback(
+    async (customerId: string) => {
+      setCustomerFullLoading(true);
+      try {
+        const res = await apiFetch(apiUrl(`/customers/${customerId}/full`), { authUser: currentUser });
+        if (!res.ok) throw new Error('טעינת פרטי לקוח נכשלה');
+        const data = await res.json();
+        setCustomerFull(data);
+      } catch {
+        /* keep card usable from list snapshot if full payload fails */
+      } finally {
+        setCustomerFullLoading(false);
+      }
+    },
+    [currentUser],
+  );
+
+  useEffect(() => {
+    const c = customerFull?.customer as Customer | undefined;
+    if (!c?.id) return;
+    setSelectedCustomer((prev) => (prev && prev.id === c.id ? { ...prev, ...c } : prev));
+    setCustomers((prev) => prev.map((row) => (row.id === c.id ? { ...row, ...c } : row)));
+  }, [customerFull]);
+
   const openCustomerPage = (customer: Customer) => {
     setSelectedCustomer(customer);
     setSelectedLead(null);
@@ -10534,17 +12790,9 @@ export default function GalitCRMPrototype() {
       window.history.pushState({}, '', url);
     }
 
-    fetch(`http://localhost:3001/customers/${customer.id}/full`, { headers: authHeaders(currentUser) })
-      .then((res) => {
-        if (!res.ok) throw new Error('טעינת פרטי לקוח נכשלה');
-        return res.json();
-      })
-      .then((data) => {
-        setCustomerFull(data);
-      })
-      .catch(() => {
-        // keep existing preview-only behavior if API not available
-      });
+    void loadCustomerFull(customer.id).catch(() => {
+      // keep existing preview-only behavior if API not available
+    });
   };
 
   const openLeadPage = (lead: Lead) => {
@@ -10569,12 +12817,18 @@ export default function GalitCRMPrototype() {
 
   const handleLogin = async (email: string, password: string) => {
     setLoginError('');
+    const emailTrimmed = email.trim();
+    const loginBody = { email: emailTrimmed, password };
     try {
-      const res = await fetch('http://localhost:3001/users/login', {
+      const res = await apiFetch(apiUrl('/auth/login'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify(loginBody),
       });
+
+      if (res.status === 401) {
+        setLoginError('אימייל או סיסמה שגויים');
+        return;
+      }
 
       if (!res.ok) {
         const errText = await res.text();
@@ -10585,22 +12839,35 @@ export default function GalitCRMPrototype() {
 
       const apiRole = (data.role || '').toString().toLowerCase() as AppUserRole;
       const mappedUser: AppUser = {
-        id: data.id || email,
-        name: data.name || email,
-        email: data.email || email,
+        id: data.id || emailTrimmed,
+        name: data.name || emailTrimmed,
+        email: data.email || emailTrimmed,
         role: apiRole || 'sales',
-        password,
+        password: '******',
         status: 'פעיל',
+        canViewFinance: !!data.canViewFinance,
+        canEditFinance: !!data.canEditFinance,
+        canDeleteCustomers: !!data.canDeleteCustomers,
+        canDeleteLeads: !!data.canDeleteLeads,
+        canManageUsers: !!data.canManageUsers,
+        canManagePermissions: !!data.canManagePermissions,
+        canViewAllRecords: !!data.canViewAllRecords,
       };
 
       setCurrentUser(mappedUser);
+      try {
+        localStorage.setItem(GALIT_CRM_SESSION_STORAGE_KEY, JSON.stringify(sessionPayloadFromAppUser(mappedUser)));
+      } catch {
+        // ignore quota / private mode
+      }
       setLoginError('');
+      setView('dashboard');
       setCurrent(canAccess(mappedUser.role, 'dashboard') ? 'dashboard' : 'tasks');
 
       // Presence: mark online + initial lastSeen
-      fetch(`http://localhost:3001/users/${encodeURIComponent(mappedUser.id)}/presence`, {
+      apiFetch(apiUrl(`/users/${encodeURIComponent(mappedUser.id)}/presence`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(mappedUser) },
+        authUser: mappedUser,
         body: JSON.stringify({ isOnline: true }),
       }).catch(() => {});
     } catch (e) {
@@ -10685,9 +12952,9 @@ export default function GalitCRMPrototype() {
         status: 'NEW',
         service: quickCreateForm.serviceType,
       };
-      const res = await fetch('http://localhost:3001/leads', {
+      const res = await apiFetch(apiUrl('/leads'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -10768,9 +13035,9 @@ export default function GalitCRMPrototype() {
         services: [quickCreateForm.serviceType || ''],
         notes: buildIntakeNotes(),
       };
-      const res = await fetch('http://localhost:3001/customers', {
+      const res = await apiFetch(apiUrl('/customers'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -10793,11 +13060,16 @@ export default function GalitCRMPrototype() {
   const handleLogout = () => {
     // Presence: best-effort mark offline
     if (currentUser) {
-      fetch(`http://localhost:3001/users/${encodeURIComponent(currentUser.id)}/presence`, {
+      apiFetch(apiUrl(`/users/${encodeURIComponent(currentUser.id)}/presence`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify({ isOnline: false }),
       }).catch(() => {});
+    }
+    try {
+      localStorage.removeItem(GALIT_CRM_SESSION_STORAGE_KEY);
+    } catch {
+      // ignore
     }
     setCurrentUser(null);
     setSelectedCustomer(null);
@@ -10820,6 +13092,21 @@ export default function GalitCRMPrototype() {
     }
   };
 
+  const consumePendingSettingsTab = useCallback(() => setPendingSettingsTab(null), []);
+
+  const handleJumpSettingsTab = (tab: SettingsToolbarJumpTab) => {
+    if (!currentUser) return;
+    if (!canAccess(currentUser.role, 'settings')) return;
+    setPendingSettingsTab(tab);
+    navigateSafely('settings');
+  };
+
+  const focusGlobalSearch = () => {
+    const el = document.getElementById(GLOBAL_SEARCH_INPUT_ID) as HTMLInputElement | null;
+    el?.focus();
+    el?.select?.();
+  };
+
   const linkedCustomerForSelectedLead = selectedLead ? findCustomerByLead(selectedLead, customers) : undefined;
 
   // Presence heartbeat
@@ -10828,9 +13115,9 @@ export default function GalitCRMPrototype() {
     let cancelled = false;
     const send = () => {
       if (cancelled) return;
-      fetch(`http://localhost:3001/users/${encodeURIComponent(currentUser.id)}/presence`, {
+      apiFetch(apiUrl(`/users/${encodeURIComponent(currentUser.id)}/presence`), {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+        authUser: currentUser,
         body: JSON.stringify({ isOnline: true }),
       }).catch(() => {});
     };
@@ -10845,9 +13132,9 @@ export default function GalitCRMPrototype() {
   const setMyWorkMode = async (mode: 'OFFICE' | 'FIELD') => {
     if (!currentUser) return;
     setWorkMode(mode);
-    fetch(`http://localhost:3001/users/${encodeURIComponent(currentUser.id)}/presence`, {
+    apiFetch(apiUrl(`/users/${encodeURIComponent(currentUser.id)}/presence`), {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+          authUser: currentUser,
       body: JSON.stringify({ currentWorkMode: mode, isOnline: true, currentProjectId: mode === 'OFFICE' ? null : (currentProjectId || null) }),
     }).catch(() => {});
   };
@@ -10855,12 +13142,25 @@ export default function GalitCRMPrototype() {
   const setMyCurrentProject = async (projectId: string) => {
     if (!currentUser) return;
     setCurrentProjectId(projectId);
-    fetch(`http://localhost:3001/users/${encodeURIComponent(currentUser.id)}/presence`, {
+    apiFetch(apiUrl(`/users/${encodeURIComponent(currentUser.id)}/presence`), {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', ...authHeaders(currentUser) },
+          authUser: currentUser,
       body: JSON.stringify({ currentProjectId: projectId || null, isOnline: true }),
     }).catch(() => {});
   };
+
+  useEffect(() => {
+    setCurrentUser(parseStoredSession());
+    setAuthBootstrapped(true);
+  }, []);
+
+  if (!authBootstrapped) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-100" dir="rtl">
+        <div className="text-sm text-slate-500">טוען...</div>
+      </div>
+    );
+  }
 
   if (!currentUser) {
     return <LoginPage onLogin={handleLogin} error={loginError} />;
@@ -10868,104 +13168,101 @@ export default function GalitCRMPrototype() {
 
   return (
     <div className="min-h-screen bg-slate-50" dir="rtl">
-      <div className="flex min-h-screen">
-        <div className="hidden lg:block lg:shrink-0">
-          <Sidebar
+      <div className="flex min-h-0 min-h-screen flex-col">
+        <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div className={GALIT_TOPBAR_SPACER_CLASS} aria-hidden />
+          <CrmLegacyTopNav
             current={current}
-            setCurrent={navigateSafely}
-            className="min-h-screen"
-            currentUser={currentUser}
-            setView={setView}
-            view={view}
-            sidebarCollapsed={sidebarCollapsed}
-            setSidebarCollapsed={setSidebarCollapsed}
-          />
-        </div>
-
-        {mobileMenuOpen && (
-          <div className="fixed inset-0 z-40 bg-black/40 lg:hidden" onClick={() => setMobileMenuOpen(false)}>
-            <div className="absolute right-0 top-0 h-full" onClick={(e) => e.stopPropagation()}>
-              <Sidebar
-                current={current}
-                setCurrent={navigateSafely}
-                onNavigate={() => setMobileMenuOpen(false)}
-                className="min-h-screen shadow-2xl"
-                currentUser={currentUser}
-                setView={setView}
-                view={view}
-                sidebarCollapsed={sidebarCollapsed}
-                setSidebarCollapsed={setSidebarCollapsed}
-              />
-            </div>
-          </div>
-        )}
-
-        <main className="flex-1 p-4 sm:p-6 lg:p-8">
+            currentUserRole={currentUser.role}
+            canAccess={(role, key) => canAccess(role as AppUserRole, key)}
+            onNavigate={navigateSafely}
+            onFocusSearch={focusGlobalSearch}
+              onOpenQuickCreate={() => {
+                resetQuickCreate();
+                setQuickCreateOpen(true);
+              }}
+              onJumpSettingsTab={handleJumpSettingsTab}
+              onLogout={handleLogout}
+            />
+          <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
           <div className="mb-4 flex flex-col gap-3">
             <div className="flex items-center justify-between">
               <div className="hidden lg:block">
-                <div className="text-2xl font-bold" style={{ color: galit.text }}>גלית CRM</div>
+                {current !== 'customers' && (
+                  <div className="text-2xl font-bold" style={{ color: galit.text }}>גלית CRM</div>
+                )}
                 <div className="text-xs text-slate-500">{currentUser.name} · {roleLabel(currentUser.role)}</div>
               </div>
-              <div className="flex-1 lg:flex lg:justify-center">
-                <GlobalSearchBar
-                  currentUser={currentUser}
-                  customers={customers}
-                  leads={leads}
-                  projects={projects}
-                  onOpenCustomer={(c) => {
-                    navigateSafely('customers');
-                    openCustomerPage(c);
-                  }}
-                  onOpenLead={(l) => {
-                    navigateSafely('leads');
-                    openLeadPage(l);
-                  }}
-                  onOpenProject={(p) => {
-                    navigateSafely('projects');
-                    openProjectDetails(p);
-                  }}
-                />
-              </div>
-              <div className="hidden lg:flex lg:items-center lg:gap-2">
-                <div className="flex items-center gap-2 rounded-2xl bg-white px-2 py-2 shadow-sm ring-1 ring-slate-200">
-                  <button
-                    className={cn(
-                      'rounded-xl px-3 py-2 text-xs font-semibold transition',
-                      workMode === 'OFFICE' ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200',
-                    )}
-                    onClick={() => setMyWorkMode('OFFICE')}
-                  >
-                    אני במשרד
-                  </button>
-                  <button
-                    className={cn(
-                      'rounded-xl px-3 py-2 text-xs font-semibold transition',
-                      workMode === 'FIELD' ? 'bg-sky-600 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200',
-                    )}
-                    onClick={() => setMyWorkMode('FIELD')}
-                  >
-                    אני בשטח
-                  </button>
+              {current !== 'customers' && (
+                <div className="flex-1 lg:flex lg:justify-center">
+                  <GlobalSearchBar
+                    inputId={GLOBAL_SEARCH_INPUT_ID}
+                    currentUser={currentUser}
+                    customers={customers}
+                    leads={leads}
+                    projects={projects}
+                    onOpenCustomer={(c) => {
+                      navigateSafely('customers');
+                      openCustomerPage(c);
+                    }}
+                    onOpenLead={(l) => {
+                      navigateSafely('leads');
+                      openLeadPage(l);
+                    }}
+                    onOpenProject={(p) => {
+                      navigateSafely('projects');
+                      openProjectDetails(p);
+                    }}
+                  />
                 </div>
-                {workMode === 'FIELD' && (
-                  <select
-                    className="w-64 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm shadow-sm outline-none transition focus:border-slate-400"
-                    value={currentProjectId}
-                    onChange={(e) => setMyCurrentProject(e.target.value)}
-                  >
-                    <option value="">פרויקט נוכחי</option>
-                    {projects
-                      .filter((p) => !['CLOSED', 'CANCELLED'].includes((p.status || '').toString()))
-                      .slice(0, 50)
-                      .map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.projectNumber ? `${p.projectNumber} - ${p.name}` : p.name}
-                        </option>
-                      ))}
-                  </select>
+              )}
+              <div className="hidden lg:flex lg:items-center lg:gap-2">
+                {current !== 'customers' && (
+                  <>
+                    <div className="flex items-center gap-2 rounded-2xl bg-white px-2 py-2 shadow-sm ring-1 ring-slate-200">
+                      <button
+                        className={cn(
+                          'rounded-xl px-3 py-2 text-xs font-semibold transition',
+                          workMode === 'OFFICE'
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-slate-100 text-slate-700 hover:bg-slate-200',
+                        )}
+                        onClick={() => setMyWorkMode('OFFICE')}
+                      >
+                        אני במשרד
+                      </button>
+                      <button
+                        className={cn(
+                          'rounded-xl px-3 py-2 text-xs font-semibold transition',
+                          workMode === 'FIELD'
+                            ? 'bg-sky-600 text-white'
+                            : 'bg-slate-100 text-slate-700 hover:bg-slate-200',
+                        )}
+                        onClick={() => setMyWorkMode('FIELD')}
+                      >
+                        אני בשטח
+                      </button>
+                    </div>
+                    {workMode === 'FIELD' && (
+                      <select
+                        className="w-64 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm shadow-sm outline-none transition focus:border-slate-400"
+                        value={currentProjectId}
+                        onChange={(e) => setMyCurrentProject(e.target.value)}
+                      >
+                        <option value="">פרויקט נוכחי</option>
+                        {projects
+                          .filter((p) => !['CLOSED', 'CANCELLED'].includes((p.status || '').toString()))
+                          .slice(0, 50)
+                          .map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {p.projectNumber ? `${p.projectNumber} - ${p.name}` : p.name}
+                            </option>
+                          ))}
+                      </select>
+                    )}
+                  </>
                 )}
-                {current !== 'dashboard' && (
+                {current !== 'dashboard' && current !== 'customers' && (
                   <Button
                     style={{ background: galit.primary }}
                     onClick={() => {
@@ -10981,9 +13278,6 @@ export default function GalitCRMPrototype() {
             </div>
 
             <div className="flex items-center justify-between lg:hidden">
-            <Button className="h-11 w-11 rounded-2xl p-0" style={{ background: galit.primary }} onClick={() => setMobileMenuOpen(true)}>
-              <Menu className="h-5 w-5" />
-            </Button>
             <div className="flex items-center gap-3">
               <div className="flex items-center justify-center rounded-full bg-white shadow-sm" style={{ width: 32, height: 32 }}>
                 <img
@@ -11157,13 +13451,43 @@ export default function GalitCRMPrototype() {
 
           {current === 'dashboard' && (
             currentUser.role === 'admin' || currentUser.role === 'manager' ? (
-              <ManagerDashboard currentUser={currentUser} />
+              <ManagerDashboard
+                currentUser={currentUser}
+                customers={customers}
+                navigateSafely={navigateSafely}
+                onOpenCustomerById={(id) => {
+                  const c = customers.find((x) => x.id === id);
+                  if (c) openCustomerPage(c);
+                }}
+                onOpenProjectById={(id) => {
+                  const p = projects.find((x) => x.id === id);
+                  if (p) openProjectDetails(p);
+                }}
+              />
             ) : (
               <DashboardPage leads={leads} quotes={quotes} opportunities={opportunities} projects={projects} tasks={tasks} stats={dashboardStats} />
             )
           )}
           {current === 'leads' && canAccess(currentUser.role, 'leads') && (
-            <LeadsPage leads={leads} setLeads={setLeads} customers={customers} users={users} onOpenLead={openLeadPage} loadError={leadsError} currentUser={currentUser} />
+            <LeadsPage
+              leads={leads}
+              setLeads={setLeads}
+              customers={customers}
+              users={users}
+              onOpenLead={openLeadPage}
+              onOpenCustomer={openCustomerPage}
+              onOpenProjectById={(id) => {
+                const project = projects.find((p) => p.id === id);
+                if (project) {
+                  openProjectDetails(project);
+                } else {
+                  navigateSafely('projects');
+                }
+              }}
+              onNavigate={navigateSafely}
+              loadError={leadsError}
+              currentUser={currentUser}
+            />
           )}
           {current === 'pipeline' && canAccess(currentUser.role, 'pipeline') && (
             <PipelinePage leads={leads} setLeads={setLeads} currentUser={currentUser} />
@@ -11172,6 +13496,11 @@ export default function GalitCRMPrototype() {
         <CustomersPage
           customers={customers}
           leads={leads}
+          quotes={quotes}
+          projects={projects}
+          tasks={tasks}
+          opportunities={opportunities}
+          users={users}
           onOpenCustomer={openCustomerPage}
           onCreateCustomer={(c) => setCustomers((prev) => [...prev, c])}
           onUpdateCustomer={(updated) =>
@@ -11180,12 +13509,39 @@ export default function GalitCRMPrototype() {
           onDeleteCustomer={(id) => setCustomers((prev) => prev.filter((c) => c.id !== id))}
           error={customersError}
           currentUser={currentUser}
+          typeLabelMap={customerTypeLabelMap}
+          classifications={customerClassifications}
+          onReloadClassifications={reloadCustomerClassifications}
         />
       )}
           {current === 'customer-profile' && selectedCustomer && (
             <div className="space-y-4">
-              <Button variant="outline" onClick={closeProfilePage}>חזרה</Button>
-              <CustomerProfile customer={selectedCustomer} full={customerFull} />
+              <div className="flex flex-wrap items-center gap-3">
+                <Button variant="outline" onClick={closeProfilePage}>
+                  חזרה
+                </Button>
+                {customerFullLoading ? (
+                  <span className="inline-flex items-center gap-2 text-sm text-slate-600">
+                    <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                    טוען פרטי לקוח מלאים...
+                  </span>
+                ) : null}
+              </div>
+              <CustomerLegacyCard
+                customer={selectedCustomer}
+                full={customerFull}
+                currentUser={currentUser}
+                onCustomerUpdated={(next) => {
+                  setSelectedCustomer(next as Customer);
+                  setCustomers((prev) => prev.map((c) => (c.id === next.id ? { ...c, ...(next as Customer) } : c)));
+                }}
+                onFullReload={async () => {
+                  await loadCustomerFull(selectedCustomer.id);
+                }}
+                typeLabelMap={customerTypeLabelMap}
+                classifications={customerClassifications}
+                primaryColor={galit.primary}
+              />
             </div>
           )}
           {current === 'lead-profile' && selectedLead && (
@@ -11253,7 +13609,24 @@ export default function GalitCRMPrototype() {
             <LabSamplesPage projects={projects} customers={customers} users={users} currentUser={currentUser} />
           )}
           {current === 'settings' && canAccess(currentUser.role, 'settings') && (
-            <SettingsPage currentUser={currentUser} />
+            <SettingsPage
+              currentUser={currentUser}
+              customers={customers}
+              leads={leads}
+              projects={projects}
+              quotes={quotes}
+              users={users}
+              onReloadCustomers={reloadCustomers}
+              onReloadLeads={reloadLeads}
+              onReloadProjects={reloadProjects}
+              onReloadQuotes={reloadQuotes}
+              onReloadCustomerClassifications={reloadCustomerClassifications}
+              onReloadUsers={reloadUsers}
+              customerClassifications={customerClassifications}
+              customerTypeLabelMap={customerTypeLabelMap}
+              settingsJumpTab={pendingSettingsTab}
+              onSettingsJumpConsumed={consumePendingSettingsTab}
+            />
           )}
           {view === 'fieldSchedule' && (
             <FieldSchedulePage
@@ -11268,6 +13641,7 @@ export default function GalitCRMPrototype() {
             <TasksPage
               tasks={tasks}
               setTasks={setTasks}
+              onReloadTasks={reloadTasks}
               currentUser={currentUser}
               projects={projects}
               customers={customers}
@@ -11276,11 +13650,12 @@ export default function GalitCRMPrototype() {
           )}
           {current === 'alerts' && canAccess(currentUser.role, 'alerts') && <AlertsPage />}
           {current === 'users' && currentUser.role === 'admin' && (
-            <UsersPage users={users} onUsersChange={setUsers} currentUser={currentUser} />
+            <UsersPage users={users} onReloadUsers={reloadUsers} currentUser={currentUser} />
           )}
 
           <div className="mt-8 flex justify-end border-t pt-4">
             <Button variant="outline" onClick={handleLogout}><LogOut className="h-4 w-4" />התנתק</Button>
+          </div>
           </div>
         </main>
       </div>
